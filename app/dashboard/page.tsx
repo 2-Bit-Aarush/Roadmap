@@ -104,6 +104,15 @@ function DashboardContent() {
             node:roadmap_nodes (
               id,
               title,
+              roadmap_id,
+              section_id,
+              roadmaps (
+                id,
+                title,
+                category,
+                difficulty,
+                estimated_duration
+              ),
               section:roadmap_sections (
                 id,
                 title,
@@ -120,6 +129,24 @@ function DashboardContent() {
           .eq("user_id", userId);
 
         const progressRecords = rawProgress || [];
+
+        const getRoadmapId = (node: any) => {
+          if (!node) return null;
+          if (node.roadmap_id) return node.roadmap_id;
+          if (node.section?.roadmap?.id) return node.section.roadmap.id;
+          return null;
+        };
+
+        const getRoadmapDetails = (node: any) => {
+          if (!node) return null;
+          if (node.roadmap_id && node.roadmaps) {
+            return node.roadmaps;
+          }
+          if (node.section?.roadmap) {
+            return node.section.roadmap;
+          }
+          return null;
+        };
         
         // Group progress by roadmap
         const roadmapMap: Record<string, {
@@ -136,33 +163,71 @@ function DashboardContent() {
         // Fetch all nodes for roads user has started to calculate correct percentage
         const roadmapIds = Array.from(new Set(
           progressRecords
-            .map((p: any) => p.node?.section?.roadmap?.id)
+            .map((p: any) => getRoadmapId(p.node))
             .filter(Boolean)
         ));
 
         let allNodesList: any[] = [];
         if (roadmapIds.length > 0) {
-          // Fetch all nodes and sections of these roadmaps
+          // Fetch all direct nodes (v2)
+          const { data: directNodes } = await supabase
+            .from("roadmap_nodes")
+            .select("id, title, roadmap_id")
+            .in("roadmap_id", roadmapIds);
+
+          // Fetch all sections of these roadmaps (v1)
           const { data: sectionsData } = await supabase
             .from("roadmap_sections")
             .select("id, title, roadmap_id")
             .in("roadmap_id", roadmapIds);
 
           const sectionIds = sectionsData?.map(s => s.id) || [];
-          
+          let legacyNodes: any[] = [];
           if (sectionIds.length > 0) {
             const { data: nodesData } = await supabase
               .from("roadmap_nodes")
               .select("id, title, section_id, roadmap_sections(roadmap_id, title)")
               .in("section_id", sectionIds);
-            
-            allNodesList = nodesData || [];
+            legacyNodes = nodesData || [];
           }
+
+          // Combine both, avoiding duplicates
+          const seenIds = new Set<string>();
+          const combined: any[] = [];
+
+          if (directNodes) {
+            directNodes.forEach(n => {
+              seenIds.add(n.id);
+              combined.push({
+                id: n.id,
+                title: n.title,
+                roadmap_id: n.roadmap_id,
+                section_id: null,
+                roadmap_sections: null
+              });
+            });
+          }
+
+          legacyNodes.forEach(n => {
+            if (!seenIds.has(n.id)) {
+              seenIds.add(n.id);
+              combined.push({
+                id: n.id,
+                title: n.title,
+                roadmap_id: n.roadmap_sections?.roadmap_id || null,
+                section_id: n.section_id,
+                roadmap_sections: n.roadmap_sections
+              });
+            }
+          });
+
+          allNodesList = combined;
         }
 
         // Initialize maps
         roadmapIds.forEach((rId) => {
-          const rNodeSample = progressRecords.find((p: any) => p.node?.section?.roadmap?.id === rId)?.node?.section?.roadmap;
+          const rNodeRecord = progressRecords.find((p: any) => getRoadmapId(p.node) === rId);
+          const rNodeSample = getRoadmapDetails(rNodeRecord?.node);
           if (rNodeSample) {
             roadmapMap[rId] = {
               id: rId,
@@ -170,8 +235,8 @@ function DashboardContent() {
               category: rNodeSample.category,
               difficulty: rNodeSample.difficulty,
               duration: rNodeSample.estimated_duration,
-              totalNodes: allNodesList.filter(n => n.roadmap_sections?.roadmap_id === rId).length,
-              completedNodes: progressRecords.filter((p: any) => p.node?.section?.roadmap?.id === rId && p.completed).length,
+              totalNodes: allNodesList.filter(n => n.roadmap_id === rId || n.roadmap_sections?.roadmap_id === rId).length,
+              completedNodes: progressRecords.filter((p: any) => getRoadmapId(p.node) === rId && p.completed).length,
               nodes: [],
             };
           }
@@ -179,12 +244,12 @@ function DashboardContent() {
 
         // Add node details to grouped data
         progressRecords.forEach((item: any) => {
-          const rId = item.node?.section?.roadmap?.id;
+          const rId = getRoadmapId(item.node);
           if (rId && roadmapMap[rId]) {
             roadmapMap[rId].nodes.push({
               nodeId: item.node.id,
               nodeTitle: item.node.title,
-              sectionTitle: item.node.section?.title,
+              sectionTitle: item.node.section?.title || "",
               completed: item.completed,
               completedAt: item.completed_at,
             });

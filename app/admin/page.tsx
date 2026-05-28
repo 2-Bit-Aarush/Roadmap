@@ -611,6 +611,34 @@ function AdminContent() {
                 </div>
               </div>
 
+              {/* Migration Alert for v1 */}
+              {selectedRoadmapForContent.schema_version !== "v2" && (
+                <div className="p-5 rounded-2xl border border-amber-500/30 bg-amber-500/10 text-amber-200 mb-8 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 backdrop-blur-sm">
+                  <div>
+                    <h4 className="font-bold text-sm">Legacy Format (Section/Node)</h4>
+                    <p className="text-xs text-amber-200/70 mt-1 max-w-xl">
+                      This roadmap is currently using the legacy Section/Node format. You can migrate it to the new visual Flowchart Graph layout. This will execute server-side as a single atomic transaction and preserve user progress.
+                    </p>
+                  </div>
+                  <Button
+                    onClick={async () => {
+                      if (!confirm("Are you sure you want to migrate this roadmap to the visual flowchart editor? This will automatically layout sections vertically and connect nodes sequentially. This transaction-safe migration cannot be undone.")) return;
+                      try {
+                        const { error } = await supabase.rpc("migrate_roadmap_to_v2", { target_roadmap_id: selectedRoadmapForContent.id });
+                        if (error) throw error;
+                        toast.success("Successfully migrated roadmap to flowchart (v2)!");
+                        router.push(`/admin/edit/${selectedRoadmapForContent.id}`);
+                      } catch (err: any) {
+                        toast.error(err.message || "Failed to migrate roadmap");
+                      }
+                    }}
+                    className="bg-amber-600 hover:bg-amber-500 text-white border-0 shrink-0 text-xs font-semibold cursor-pointer py-2 px-4 rounded-lg"
+                  >
+                    Migrate to Flowchart (v2)
+                  </Button>
+                </div>
+              )}
+
               <div className="grid lg:grid-cols-3 gap-8 items-start">
                 {/* Left Columns - Architect list */}
                 <div className="lg:col-span-2 space-y-6">
@@ -1009,7 +1037,13 @@ function AdminContent() {
                                   <Button
                                     variant="outline"
                                     size="sm"
-                                    onClick={() => loadRoadmapContent(rm)}
+                                    onClick={() => {
+                                      if (rm.schema_version === "v2") {
+                                        router.push(`/admin/edit/${rm.id}`);
+                                      } else {
+                                        loadRoadmapContent(rm);
+                                      }
+                                    }}
                                     className="border-white/10 hover:bg-white/5 text-cyan-400 cursor-pointer"
                                   >
                                     <Settings className="h-3.5 w-3.5 mr-1" />
