@@ -45,7 +45,8 @@ import {
   PlusCircle,
   X,
   ExternalLink,
-  ChevronRight
+  ChevronRight,
+  RefreshCw
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/utils";
@@ -133,6 +134,8 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
   const [isLocked, setIsLocked] = useState(false);
   const [lockHolder, setLockHolder] = useState<any>(null);
   const [snapToGrid, setSnapToGrid] = useState(true);
+  const [lastLoadedUpdatedAt, setLastLoadedUpdatedAt] = useState<string | null>(null);
+  const [hasRemoteUpdates, setHasRemoteUpdates] = useState(false);
 
   // Search & Navigation
   const [searchQuery, setSearchQuery] = useState("");
@@ -195,6 +198,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
 
         if (roadmapError) throw roadmapError;
         setRoadmap(roadmapData);
+        setLastLoadedUpdatedAt(roadmapData.updated_at);
 
         // Check locks
         const now = new Date();
@@ -206,14 +210,18 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
 
         if (hasActiveLock && roadmapData.locked_by !== session.user.id) {
           setIsLocked(true);
-          setLockHolder(roadmapData.profiles || { name: "Another Admin", email: "" });
+          setLockHolder({
+            id: roadmapData.locked_by,
+            name: roadmapData.profiles?.name || "Another Admin",
+            email: roadmapData.profiles?.email || ""
+          });
         } else {
           // Acquire Lock
           await acquireLock(session.user.id);
         }
 
         // Load Nodes and Edges
-        await loadGraphData();
+        await loadGraphData(session.user.id);
         await loadVersions();
 
       } catch (err) {
@@ -232,6 +240,20 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
       if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
     };
   }, [roadmapId, router]);
+
+  // Audit log function
+  const recordAdminLog = async (action: string, details: any) => {
+    if (!adminUser) return;
+    try {
+      await supabase.from("admin_logs").insert({
+        admin_id: adminUser.id,
+        action,
+        details,
+      });
+    } catch (e) {
+      console.error("Failed to log admin action:", e);
+    }
+  };
 
   // Lock Actions
   const acquireLock = async (userId: string) => {
@@ -255,8 +277,17 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
     if (!confirm("Are you sure you want to override and take over the editing lock? The other admin's active session will be disconnected.")) return;
     setLoading(true);
     try {
+      const prevOwnerId = lockHolder?.id || null;
       await acquireLock(adminUser.id);
-      await loadGraphData();
+      
+      // Log force unlock audit event
+      await recordAdminLog("force_unlock", {
+        roadmap_id: roadmapId,
+        previous_owner_id: prevOwnerId,
+        timestamp: new Date().toISOString()
+      });
+
+      await loadGraphData(adminUser.id);
       toast.success("Lock overridden successfully!");
     } catch {
       toast.error("Failed to force unlock");
@@ -305,9 +336,190 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
     return () => clearInterval(interval);
   }, [isLocked, adminUser, roadmapId]);
 
+  // Realtime subscription and Polling fallback for graph changes
+  useEffect(() => {
+    if (!roadmapId || !adminUser) return;
+
+    const channel = supabase
+      .channel(`roadmap-graph-changes-${roadmapId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "roadmap_nodes",
+          filter: `roadmap_id=eq.${roadmapId}`
+        },
+        () => {
+          console.log("[Realtime] Nodes updated remotely.");
+          if (isLocked) {
+            loadGraphData(adminUser.id);
+          } else {
+            setHasRemoteUpdates(true);
+          }
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "roadmap_edges",
+          filter: `roadmap_id=eq.${roadmapId}`
+        },
+        () => {
+          console.log("[Realtime] Edges updated remotely.");
+          if (isLocked) {
+            loadGraphData(adminUser.id);
+          } else {
+            setHasRemoteUpdates(true);
+          }
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "roadmaps",
+          filter: `id=eq.${roadmapId}`
+        },
+        (payload) => {
+          console.log("[Realtime] Roadmap updated remotely:", payload);
+          const newRoadmap = payload.new as any;
+          if (newRoadmap) {
+            setRoadmap(newRoadmap);
+            const now = new Date();
+            const lockExpiry = 5 * 60 * 1000;
+            const hasActiveLock =
+              newRoadmap.locked_by &&
+              newRoadmap.locked_at &&
+              now.getTime() - new Date(newRoadmap.locked_at).getTime() < lockExpiry;
+
+            if (hasActiveLock && newRoadmap.locked_by !== adminUser.id) {
+              setIsLocked(true);
+              supabase
+                .from("profiles")
+                .select("name, email")
+                .eq("id", newRoadmap.locked_by)
+                .single()
+                .then(({ data }) => {
+                  setLockHolder({
+                    id: newRoadmap.locked_by,
+                    name: data?.name || "Another Admin",
+                    email: data?.email || ""
+                  });
+                });
+            } else if (!hasActiveLock || newRoadmap.locked_by === adminUser.id) {
+              setIsLocked(false);
+              setLockHolder(null);
+            }
+          }
+        }
+      )
+      .subscribe();
+
+    // Polling fallback every 15 seconds to ensure eventual consistency
+    const pollInterval = setInterval(() => {
+      if (isLocked) {
+        loadGraphData(adminUser.id);
+      } else {
+        supabase
+          .from("roadmaps")
+          .select("updated_at")
+          .eq("id", roadmapId)
+          .single()
+          .then(({ data }) => {
+            if (data && lastLoadedUpdatedAt && new Date(data.updated_at).getTime() > new Date(lastLoadedUpdatedAt).getTime()) {
+              setHasRemoteUpdates(true);
+            }
+          });
+      }
+    }, 15000);
+
+    return () => {
+      supabase.removeChannel(channel);
+      clearInterval(pollInterval);
+    };
+  }, [roadmapId, adminUser, isLocked, lastLoadedUpdatedAt]);
+
+  // Local autosave cache recovery serialization
+  useEffect(() => {
+    if (loading || isLocked || !adminUser || nodes.length === 0) return;
+    const draft = {
+      timestamp: Date.now(),
+      roadmapId,
+      userId: adminUser.id,
+      nodes: nodes.map(n => ({
+        id: n.id,
+        position: n.position,
+        data: n.data
+      })),
+      edges: edges.map(e => ({
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        label: e.label
+      }))
+    };
+    const draftKey = `roadmap-draft-${roadmapId}-${adminUser.id}`;
+    sessionStorage.setItem(draftKey, JSON.stringify(draft));
+  }, [nodes, edges, loading, isLocked, roadmapId, adminUser]);
+
   // Fetch Graph Data
-  const loadGraphData = async () => {
+  const loadGraphData = async (currentUserId?: string) => {
     try {
+      const activeUserId = currentUserId || adminUser?.id;
+
+      // Check for local draft backup recovery
+      if (activeUserId) {
+        const draftKey = `roadmap-draft-${roadmapId}-${activeUserId}`;
+        const localDraftStr = sessionStorage.getItem(draftKey);
+        if (localDraftStr) {
+          try {
+            const parsedDraft = JSON.parse(localDraftStr);
+            const isExpired = Date.now() - Number(parsedDraft.timestamp) > 24 * 60 * 60 * 1000; // 24 hours
+            if (isExpired || parsedDraft.roadmapId !== roadmapId || parsedDraft.userId !== activeUserId) {
+              sessionStorage.removeItem(draftKey);
+            } else {
+              const restore = window.confirm("We found an unsaved local backup from your last session. Would you like to restore it?");
+              if (restore) {
+                const restoredNodes = (parsedDraft.nodes || []).map((n: any) => ({
+                  id: n.id,
+                  type: "customNode",
+                  position: n.position,
+                  data: n.data
+                }));
+                const restoredEdges = (parsedDraft.edges || []).map((e: any) => ({
+                  id: e.id,
+                  source: e.source,
+                  target: e.target,
+                  label: e.label || "",
+                  animated: true,
+                  markerEnd: { type: MarkerType.ArrowClosed, color: "#06b6d4" },
+                  style: { stroke: "#06b6d4", strokeWidth: 1.5 }
+                }));
+
+                isTrackingHistory.current = false;
+                setNodes(restoredNodes);
+                setEdges(restoredEdges);
+                setTimeout(() => {
+                  isTrackingHistory.current = true;
+                }, 100);
+                toast.success("Restored unsaved changes from local backup!");
+                return; // SKIP LOADING FROM DATABASE
+              } else {
+                sessionStorage.removeItem(draftKey);
+              }
+            }
+          } catch (err) {
+            console.error("Failed to parse local draft, removing:", err);
+            sessionStorage.removeItem(draftKey);
+          }
+        }
+      }
+
+      // If no local draft was restored, load from database
       const { data: nodesData } = await supabase
         .from("roadmap_nodes")
         .select("*")
@@ -421,6 +633,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
 
   // 3. Flowcanvas modifications handlers
   const onConnect = (params: Connection) => {
+    if (isLocked) return;
     captureHistoryState(nodes, edges);
     const newEdge: Edge = {
       ...params,
@@ -433,10 +646,12 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
   };
 
   const onNodeDragStop = () => {
+    if (isLocked) return;
     captureHistoryState(nodes, edges);
   };
 
   const handleAddBox = () => {
+    if (isLocked) return;
     // Generate fresh stable ID (valid UUIDv4 format via browser API)
     const newId = generateUUID();
     captureHistoryState(nodes, edges);
@@ -467,6 +682,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
 
   // Node details form changes
   const handleUpdateNodeDetails = () => {
+    if (isLocked) return;
     if (!selectedNodeId) return;
     captureHistoryState(nodes, edges);
     setNodes((nds) =>
@@ -491,6 +707,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
   };
 
   const handleDuplicateNode = () => {
+    if (isLocked) return;
     if (!selectedNodeId) return;
     const target = nodes.find((n) => n.id === selectedNodeId);
     if (!target) return;
@@ -512,6 +729,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
   };
 
   const handleDeleteNode = () => {
+    if (isLocked) return;
     if (!selectedNodeId) return;
     if (!confirm("Are you sure you want to delete this node? All connected edges will be removed.")) return;
     captureHistoryState(nodes, edges);
@@ -522,6 +740,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
   };
 
   const handleAddResource = () => {
+    if (isLocked) return;
     if (!resTitle || !resUrl) return;
     if (!resUrl.startsWith("http://") && !resUrl.startsWith("https://")) {
       toast.error("Please enter a valid URL (starting with http:// or https://)");
@@ -550,6 +769,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
   };
 
   const handleRemoveResource = (index: number) => {
+    if (isLocked) return;
     const updated = editResources.filter((_, idx) => idx !== index);
     setEditResources(updated);
     
@@ -596,7 +816,25 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
     setSaveStatus("Saving...");
 
     try {
-      // 1. Fetch current database nodes for this roadmap
+      // 1. Version conflict check: Fetch current database roadmap updated_at timestamp
+      const { data: currentRoadmap, error: roadmapCheckError } = await supabase
+        .from("roadmaps")
+        .select("updated_at")
+        .eq("id", roadmapId)
+        .single();
+
+      if (roadmapCheckError) throw roadmapCheckError;
+
+      if (currentRoadmap && lastLoadedUpdatedAt && new Date(currentRoadmap.updated_at).getTime() > new Date(lastLoadedUpdatedAt).getTime()) {
+        setSaveStatus("Error");
+        if (!isAutosaveMode) {
+          toast.error("Save rejected: This roadmap was updated by another user since you loaded it. Please sync updates first.");
+        }
+        setHasRemoteUpdates(true);
+        return;
+      }
+
+      // 2. Fetch current database nodes for this roadmap (to compute deletions)
       const { data: dbNodes, error: dbError } = await supabase
         .from("roadmap_nodes")
         .select("id, title, description, x_position, y_position, node_type, color, resources, metadata")
@@ -604,7 +842,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
 
       if (dbError) throw dbError;
 
-      // 2. Fetch current database edges for this roadmap
+      // 3. Fetch current database edges for this roadmap (to compute deletions)
       const { data: dbEdges, error: dbEdgesError } = await supabase
         .from("roadmap_edges")
         .select("id, source_node_id, target_node_id, label")
@@ -613,8 +851,6 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
       if (dbEdgesError) throw dbEdgesError;
 
       // Ensure all edges in state have valid UUIDs.
-      // If any edge was created on-canvas (e.g. starting with "e-" or similar temp ID format),
-      // we generate a clean, stable UUID for it and backport it to react-flow state.
       const updatedEdges = edges.map((e) => {
         if (!e.id || e.id.startsWith("e-") || e.id.includes("temp")) {
           return { ...e, id: generateUUID() };
@@ -645,7 +881,6 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
       for (const n of nodes) {
         const payload = {
           id: n.id,
-          roadmap_id: roadmapId,
           title: n.data.label,
           description: n.data.description || "",
           x_position: Math.round(n.position.x),
@@ -653,8 +888,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
           node_type: n.data.node_type || "topic",
           color: n.data.color || "#3b82f6",
           resources: n.data.resources || [],
-          metadata: n.data.metadata || {},
-          updated_at: new Date().toISOString()
+          metadata: n.data.metadata || {}
         };
 
         const dbN = dbNodeMap.get(n.id);
@@ -691,7 +925,6 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
       for (const e of updatedEdges) {
         const payload = {
           id: e.id,
-          roadmap_id: roadmapId,
           source_node_id: e.source,
           target_node_id: e.target,
           label: e.label || "",
@@ -715,93 +948,37 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
         }
       }
 
-      // 3. Delete removed nodes only
-      if (nodesToDelete.length > 0) {
-        const { error: delNodesError } = await supabase
-          .from("roadmap_nodes")
-          .delete()
-          .in("id", nodesToDelete.map((n) => n.id));
-        if (delNodesError) throw delNodesError;
-      }
+      // Call transaction-safe RPC function
+      const { error: rpcErr } = await supabase.rpc("save_roadmap_graph", {
+        target_roadmap_id: roadmapId,
+        nodes_to_upsert: [...nodesToInsert, ...nodesToUpdate],
+        node_ids_to_delete: nodesToDelete.map((n) => n.id),
+        edges_to_upsert: [...edgesToInsert, ...edgesToUpdate],
+        edge_ids_to_delete: edgesToDelete.map((e) => e.id),
+        is_autosave_mode: isAutosaveMode
+      });
 
-      // 4. Upsert changed/new nodes only
-      const nodesToUpsert = [...nodesToInsert, ...nodesToUpdate];
-      if (nodesToUpsert.length > 0) {
-        const { error: upsertNodesError } = await supabase
-          .from("roadmap_nodes")
-          .upsert(nodesToUpsert);
-        if (upsertNodesError) throw upsertNodesError;
-      }
-
-      // 5. Delete removed edges only
-      if (edgesToDelete.length > 0) {
-        const { error: delEdgesError } = await supabase
-          .from("roadmap_edges")
-          .delete()
-          .in("id", edgesToDelete.map((e) => e.id));
-        if (delEdgesError) throw delEdgesError;
-      }
-
-      // 6. Upsert changed/new edges only
-      const edgesToUpsert = [...edgesToInsert, ...edgesToUpdate];
-      if (edgesToUpsert.length > 0) {
-        const { error: upsertEdgesError } = await supabase
-          .from("roadmap_edges")
-          .upsert(edgesToUpsert);
-        if (upsertEdgesError) throw upsertEdgesError;
-      }
+      if (rpcErr) throw rpcErr;
 
       // Logging requirement
-      console.log("inserted count:", nodesToInsert.length + edgesToInsert.length);
-      console.log("updated count:", nodesToUpdate.length + edgesToUpdate.length);
-      console.log("deleted count:", nodesToDelete.length + edgesToDelete.length);
-      console.log("unchanged count:", nodeUnchanged + edgeUnchanged);
+      console.log(`[Save Sync RPC] Nodes: Inserted: ${nodesToInsert.length}, Updated: ${nodesToUpdate.length}, Deleted: ${nodesToDelete.length}, Unchanged: ${nodeUnchanged}`);
+      console.log(`[Save Sync RPC] Edges: Inserted: ${edgesToInsert.length}, Updated: ${edgesToUpdate.length}, Deleted: ${edgesToDelete.length}, Unchanged: ${edgeUnchanged}`);
 
-      console.log(`[Save Sync] Nodes: Inserted: ${nodesToInsert.length}, Updated: ${nodesToUpdate.length}, Deleted: ${nodesToDelete.length}, Unchanged: ${nodeUnchanged}`);
-      console.log(`[Save Sync] Edges: Inserted: ${edgesToInsert.length}, Updated: ${edgesToUpdate.length}, Deleted: ${edgesToDelete.length}, Unchanged: ${edgeUnchanged}`);
-
-      // 7. Create Version history snapshot
-      const { error: verError } = await supabase
-        .from("roadmap_versions")
-        .insert({
-          roadmap_id: roadmapId,
-          nodes_data: nodes.map((n) => ({
-            id: n.id,
-            label: n.data.label,
-            description: n.data.description,
-            x: n.position.x,
-            y: n.position.y,
-            node_type: n.data.node_type,
-            color: n.data.color,
-            resources: n.data.resources,
-            metadata: n.data.metadata
-          })),
-          edges_data: updatedEdges.map((e) => ({
-            id: e.id,
-            source: e.source,
-            target: e.target,
-            label: e.label
-          })),
-          is_autosave: isAutosaveMode
-        });
-
-      if (verError) throw verError;
-
-      // 8. Enforce 20-snapshot retention limit (prune old versions)
-      const { data: currentVersions } = await supabase
-        .from("roadmap_versions")
-        .select("id")
-        .eq("roadmap_id", roadmapId)
-        .order("created_at", { ascending: false });
-
-      if (currentVersions && currentVersions.length > 20) {
-        const keepIds = currentVersions.slice(0, 20).map((v) => v.id);
-        await supabase
-          .from("roadmap_versions")
-          .delete()
-          .eq("roadmap_id", roadmapId)
-          .not("id", "in", `(${keepIds.join(",")})`);
+      // Query parent roadmap to retrieve and verify updated_at timestamp
+      const { data: updatedRoadmap } = await supabase
+        .from("roadmaps")
+        .select("updated_at")
+        .eq("id", roadmapId)
+        .single();
+      
+      if (updatedRoadmap) {
+        setLastLoadedUpdatedAt(updatedRoadmap.updated_at);
+        setRoadmap((prev: any) => prev ? { ...prev, updated_at: updatedRoadmap.updated_at } : null);
       }
+
+      // Clear the local sessionStorage backup draft cache upon successful save
+      const draftKey = `roadmap-draft-${roadmapId}-${adminUser.id}`;
+      sessionStorage.removeItem(draftKey);
 
       await loadVersions();
       setSaveStatus("Saved");
@@ -819,6 +996,30 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
     }
   };
 
+  const handleManualSync = async () => {
+    if (!adminUser) return;
+    setLoading(true);
+    try {
+      const { data: roadmapData, error: roadmapError } = await supabase
+        .from("roadmaps")
+        .select("*, profiles:locked_by(name, email)")
+        .eq("id", roadmapId)
+        .single();
+      if (roadmapError) throw roadmapError;
+      setRoadmap(roadmapData);
+      setLastLoadedUpdatedAt(roadmapData.updated_at);
+      
+      // Load nodes and edges
+      await loadGraphData(adminUser.id);
+      setHasRemoteUpdates(false);
+      toast.success("Graph synchronized with database");
+    } catch (err: any) {
+      toast.error("Failed to sync: " + err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const triggerAutosave = () => {
     if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
     autosaveTimer.current = setTimeout(() => {
@@ -827,6 +1028,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
   };
 
   const handleRollback = async (ver: any) => {
+    if (isLocked) return;
     if (!confirm("Are you sure you want to roll back the current canvas to this snapshot? Canvas edits will revert but stable IDs of current nodes will be maintained on restore.")) return;
     setLoading(true);
 
@@ -874,6 +1076,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
   };
 
   const handlePublish = async () => {
+    if (isLocked) return;
     if (!roadmap) return;
     try {
       // First save current state
@@ -896,6 +1099,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
   };
 
   const handleUnpublish = async () => {
+    if (isLocked) return;
     if (!roadmap) return;
     try {
       const { error } = await supabase
@@ -922,50 +1126,6 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
     );
   }
 
-  // 5. Block editing view if locked
-  if (isLocked) {
-    return (
-      <main className="min-h-screen bg-black text-white flex items-center justify-center px-4 relative overflow-hidden">
-        <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-blue-900/20 via-background to-background pointer-events-none" />
-        <motion.div
-          initial={{ opacity: 0, scale: 0.95 }}
-          animate={{ opacity: 1, scale: 1 }}
-          className="max-w-md w-full border border-white/10 rounded-2xl bg-black/60 backdrop-blur-xl p-8 text-center space-y-6 shadow-2xl relative z-10"
-        >
-          <div className="h-16 w-16 mx-auto rounded-full bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-500">
-            <Lock className="h-8 w-8" />
-          </div>
-          <div className="space-y-2">
-            <h2 className="text-xl font-bold text-white">Roadmap is Locked</h2>
-            <p className="text-sm text-white/50 leading-relaxed">
-              This roadmap is currently being designed/edited by:
-            </p>
-            <div className="p-3 bg-white/5 border border-white/10 rounded-xl mt-2 text-sm font-semibold text-cyan-400">
-              {lockHolder?.name || "Another Admin"} ({lockHolder?.email || "No email available"})
-            </div>
-          </div>
-          <div className="flex flex-col gap-2 pt-4">
-            <Button
-              onClick={handleForceUnlock}
-              className="bg-amber-600 hover:bg-amber-500 text-white border-0 cursor-pointer w-full"
-            >
-              <Unlock className="h-4 w-4 mr-2" />
-              Force Takeover Lock
-            </Button>
-            <Button
-              variant="ghost"
-              onClick={() => router.push("/admin")}
-              className="text-white/60 hover:text-white hover:bg-white/5 cursor-pointer w-full"
-            >
-              <ArrowLeft className="h-4 w-4 mr-2" />
-              Back to Dashboard
-            </Button>
-          </div>
-        </motion.div>
-      </main>
-    );
-  }
-
   return (
     <main className="min-h-screen bg-black text-white flex flex-col h-screen overflow-hidden">
       <Toaster position="top-center" theme="dark" />
@@ -988,22 +1148,55 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
 
         {/* Action controls */}
         <div className="flex items-center gap-3">
+          {/* Lock status indicator & Force Unlock option in the header */}
+          {isLocked && (
+            <div className="flex items-center gap-2 px-2.5 py-1 bg-amber-500/10 border border-amber-500/20 rounded-lg text-[11px] text-amber-400 mr-2">
+              <Lock className="h-3.5 w-3.5 shrink-0" />
+              <span className="max-w-[200px] truncate">Locked: {lockHolder?.name || "Another Admin"}</span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handleForceUnlock}
+                className="h-6 px-2 text-[10px] bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border-0 cursor-pointer flex items-center gap-1 font-semibold"
+              >
+                <Unlock className="h-3 w-3" />
+                Unlock
+              </Button>
+            </div>
+          )}
+
+          {/* Sync Updates button */}
+          {hasRemoteUpdates && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleManualSync}
+              className="border-cyan-500/30 bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/20 h-9 px-3 text-xs cursor-pointer flex items-center gap-1 animate-pulse"
+            >
+              <RefreshCw className="h-3.5 w-3.5 animate-spin" style={{ animationDuration: '4s' }} />
+              Sync Updates
+            </Button>
+          )}
+
           {/* Save Status indicator */}
-          <span className={cn(
-            "text-[10px] px-2 py-0.5 rounded-full font-mono border",
-            saveStatus === "Saved" && "bg-emerald-500/10 border-emerald-500/20 text-emerald-400",
-            saveStatus === "Saving..." && "bg-cyan-500/10 border-cyan-500/20 text-cyan-400 animate-pulse",
-            saveStatus === "Changes made" && "bg-amber-500/10 border-amber-500/20 text-amber-400",
-            saveStatus === "Error" && "bg-destructive/10 border-destructive/20 text-destructive"
-          )}>
-            {saveStatus}
-          </span>
+          {!isLocked && (
+            <span className={cn(
+              "text-[10px] px-2 py-0.5 rounded-full font-mono border",
+              saveStatus === "Saved" && "bg-emerald-500/10 border-emerald-500/20 text-emerald-400",
+              saveStatus === "Saving..." && "bg-cyan-500/10 border-cyan-500/20 text-cyan-400 animate-pulse",
+              saveStatus === "Changes made" && "bg-amber-500/10 border-amber-500/20 text-amber-400",
+              saveStatus === "Error" && "bg-destructive/10 border-destructive/20 text-destructive"
+            )}>
+              {saveStatus}
+            </span>
+          )}
 
           <Button
             variant="outline"
             size="sm"
             onClick={() => handleSaveToDatabase(false)}
-            className="border-white/10 hover:bg-white/5 text-white/80 h-9 px-3 text-xs cursor-pointer"
+            disabled={isLocked}
+            className="border-white/10 hover:bg-white/5 text-white/80 h-9 px-3 text-xs cursor-pointer disabled:opacity-30 disabled:pointer-events-none"
           >
             <Save className="h-3.5 w-3.5 mr-1" />
             Save Draft
@@ -1014,7 +1207,8 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
               variant="outline"
               size="sm"
               onClick={handleUnpublish}
-              className="border-amber-500/30 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 h-9 px-3 text-xs cursor-pointer"
+              disabled={isLocked}
+              className="border-amber-500/30 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 h-9 px-3 text-xs cursor-pointer disabled:opacity-30 disabled:pointer-events-none"
             >
               Draft Mode
             </Button>
@@ -1022,7 +1216,8 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
             <Button
               size="sm"
               onClick={handlePublish}
-              className="bg-cyan-600 hover:bg-cyan-500 text-white border-0 h-9 px-3 text-xs font-semibold shadow-[0_0_15px_rgba(6,182,212,0.25)] cursor-pointer"
+              disabled={isLocked}
+              className="bg-cyan-600 hover:bg-cyan-500 text-white border-0 h-9 px-3 text-xs font-semibold shadow-[0_0_15px_rgba(6,182,212,0.25)] cursor-pointer disabled:opacity-30 disabled:pointer-events-none"
             >
               Publish Map
             </Button>
@@ -1052,8 +1247,8 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
             edges={edges}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
-            onConnect={onConnect}
-            onNodeDragStop={onNodeDragStop}
+            onConnect={isLocked ? undefined : onConnect}
+            onNodeDragStop={isLocked ? undefined : onNodeDragStop}
             onNodeClick={handleNodeClick}
             nodeTypes={customNodeTypes}
             snapToGrid={snapToGrid}
@@ -1061,6 +1256,10 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
             fitView
             minZoom={0.2}
             maxZoom={2}
+            nodesDraggable={!isLocked}
+            nodesConnectable={!isLocked}
+            edgesFocusable={!isLocked}
+            nodesFocusable={!isLocked}
           >
             <Background color="#333" gap={15} size={1} />
             <Controls className="!bg-black/80 !border-white/10 !rounded-lg overflow-hidden [&_button]:!bg-transparent [&_button]:!border-white/5 [&_svg]:!fill-white/70" />
@@ -1076,7 +1275,8 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
               <Button
                 size="sm"
                 onClick={handleAddBox}
-                className="bg-cyan-600 hover:bg-cyan-500 text-white text-xs h-8 border-0 cursor-pointer"
+                disabled={isLocked}
+                className="bg-cyan-600 hover:bg-cyan-500 text-white text-xs h-8 border-0 cursor-pointer disabled:opacity-30 disabled:pointer-events-none"
               >
                 <Plus className="h-3.5 w-3.5 mr-1" />
                 Add Box
@@ -1088,7 +1288,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
                 variant="ghost"
                 size="icon"
                 onClick={handleUndo}
-                disabled={undoStack.current.length === 0}
+                disabled={isLocked || undoStack.current.length === 0}
                 className="h-8 w-8 text-white/60 hover:text-white hover:bg-white/5 disabled:opacity-30 cursor-pointer"
               >
                 <Undo2 className="h-4 w-4" />
@@ -1098,7 +1298,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
                 variant="ghost"
                 size="icon"
                 onClick={handleRedo}
-                disabled={redoStack.current.length === 0}
+                disabled={isLocked || redoStack.current.length === 0}
                 className="h-8 w-8 text-white/60 hover:text-white hover:bg-white/5 disabled:opacity-30 cursor-pointer"
               >
                 <Redo2 className="h-4 w-4" />
@@ -1239,7 +1439,8 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
                       value={editTitle}
                       onChange={(e) => setEditTitle(e.target.value)}
                       onBlur={handleUpdateNodeDetails}
-                      className="bg-white/5 border-white/10 text-white placeholder:text-white/20 text-xs h-9"
+                      disabled={isLocked}
+                      className="bg-white/5 border-white/10 text-white placeholder:text-white/20 text-xs h-9 disabled:opacity-50 disabled:pointer-events-none"
                     />
                   </div>
 
@@ -1249,7 +1450,9 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
                     <select
                       id="node-type"
                       value={editType}
+                      disabled={isLocked}
                       onChange={(e) => {
+                        if (isLocked) return;
                         setEditType(e.target.value);
                         // Save node immediately
                         setNodes((nds) =>
@@ -1265,7 +1468,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
                         );
                         captureHistoryState();
                       }}
-                      className="w-full bg-white/5 border border-white/10 text-white rounded-lg p-2 text-xs focus:outline-none focus:border-cyan-500"
+                      className="w-full bg-white/5 border border-white/10 text-white rounded-lg p-2 text-xs focus:outline-none focus:border-cyan-500 disabled:opacity-50 disabled:pointer-events-none"
                     >
                       <option value="topic">Topic Node</option>
                       <option value="group">Container / Group</option>
@@ -1281,7 +1484,9 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
                       {defaultColors.map((color) => (
                         <button
                           key={color.value}
+                          disabled={isLocked}
                           onClick={() => {
+                            if (isLocked) return;
                             setEditColor(color.value);
                             // Save node color directly
                             setNodes((nds) =>
@@ -1299,7 +1504,7 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
                           }}
                           style={{ backgroundColor: color.value }}
                           className={cn(
-                            "w-6 h-6 rounded-full border-2 transition-all cursor-pointer",
+                            "w-6 h-6 rounded-full border-2 transition-all cursor-pointer disabled:opacity-50 disabled:pointer-events-none",
                             editColor === color.value ? "border-cyan-400 scale-110 shadow-[0_0_8px_currentColor]" : "border-transparent"
                           )}
                           title={color.name}
@@ -1317,7 +1522,8 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
                       value={editDesc}
                       onChange={(e) => setEditDesc(e.target.value)}
                       onBlur={handleUpdateNodeDetails}
-                      className="bg-white/5 border-white/10 text-white placeholder:text-white/20 text-xs"
+                      disabled={isLocked}
+                      className="bg-white/5 border-white/10 text-white placeholder:text-white/20 text-xs disabled:opacity-50 disabled:pointer-events-none"
                       placeholder="Add learning details and summary guidelines..."
                     />
                   </div>
@@ -1337,7 +1543,8 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
                             <button
                               type="button"
                               onClick={() => handleRemoveResource(index)}
-                              className="text-destructive hover:text-red-400 cursor-pointer"
+                              disabled={isLocked}
+                              className="text-destructive hover:text-red-400 cursor-pointer disabled:opacity-30 disabled:pointer-events-none"
                             >
                               <X className="h-3.5 w-3.5" />
                             </button>
@@ -1351,20 +1558,23 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
                         placeholder="Link Title (e.g. documentation)"
                         value={resTitle}
                         onChange={(e) => setResTitle(e.target.value)}
-                        className="bg-white/5 border-white/10 text-white placeholder:text-white/20 text-xs h-8"
+                        disabled={isLocked}
+                        className="bg-white/5 border-white/10 text-white placeholder:text-white/20 text-xs h-8 disabled:opacity-50 disabled:pointer-events-none"
                       />
                       <Input
                         placeholder="URL (https://...)"
                         value={resUrl}
                         onChange={(e) => setResUrl(e.target.value)}
-                        className="bg-white/5 border-white/10 text-white placeholder:text-white/20 text-xs h-8"
+                        disabled={isLocked}
+                        className="bg-white/5 border-white/10 text-white placeholder:text-white/20 text-xs h-8 disabled:opacity-50 disabled:pointer-events-none"
                       />
                       <Button
                         type="button"
                         variant="outline"
                         size="sm"
                         onClick={handleAddResource}
-                        className="w-full border-white/10 hover:bg-white/5 text-xs text-cyan-400 cursor-pointer h-8"
+                        disabled={isLocked}
+                        className="w-full border-white/10 hover:bg-white/5 text-xs text-cyan-400 cursor-pointer h-8 disabled:opacity-30 disabled:pointer-events-none"
                       >
                         <PlusCircle className="h-3.5 w-3.5 mr-1" />
                         Add Link
@@ -1379,14 +1589,16 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
                 <Button
                   variant="outline"
                   onClick={handleDuplicateNode}
-                  className="flex-1 border-white/10 hover:bg-white/5 text-xs cursor-pointer text-white/80 h-9"
+                  disabled={isLocked}
+                  className="flex-1 border-white/10 hover:bg-white/5 text-xs cursor-pointer text-white/80 h-9 disabled:opacity-30 disabled:pointer-events-none"
                 >
                   <Copy className="h-3.5 w-3.5 mr-1.5" />
                   Duplicate
                 </Button>
                 <Button
                   onClick={handleDeleteNode}
-                  className="flex-1 bg-destructive/10 hover:bg-destructive/20 border border-destructive/20 text-destructive text-xs cursor-pointer h-9"
+                  disabled={isLocked}
+                  className="flex-1 bg-destructive/10 hover:bg-destructive/20 border border-destructive/20 text-destructive text-xs cursor-pointer h-9 disabled:opacity-30 disabled:pointer-events-none"
                 >
                   <Trash2 className="h-3.5 w-3.5 mr-1.5" />
                   Delete Node
