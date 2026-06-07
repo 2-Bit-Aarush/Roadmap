@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, Suspense } from "react";
+import React, { useState, useEffect, Suspense, useRef } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { Navbar } from "@/components/navbar";
@@ -16,6 +16,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
+import { Progress } from "@/components/ui/progress";
+import { ReactFlow, Background, Controls } from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import { validateGraph, normalizeRoadmapSh, nativeImportSchema, normalizeSectionBased } from "@/lib/roadmap-import";
 import {
   Shield,
   FileText,
@@ -121,6 +125,402 @@ function AdminContent() {
   // Users analytics & logs
   const [usersList, setUsersList] = useState<any[]>([]);
   const [logsList, setLogsList] = useState<any[]>([]);
+
+  // Import state machine & lifecycle (Section 4)
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [importState, setImportState] = useState<'idle' | 'validating' | 'normalizing' | 'building' | 'saving_nodes' | 'saving_edges' | 'finalizing' | 'success' | 'failed' | 'cancelled'>('idle');
+  const [importProgress, setImportProgress] = useState(0);
+  const [importText, setImportText] = useState("");
+  const [importFormat, setImportFormat] = useState<'native' | 'external'>('native');
+  const [collisionAction, setCollisionAction] = useState<'overwrite' | 'merge' | 'duplicate'>('duplicate');
+  const [importFilename, setImportFilename] = useState("");
+  const [importTargetRmId, setImportTargetRmId] = useState<string | null>(null);
+  
+  // Dry run / preview states (Section 8)
+  const [validationOutput, setValidationOutput] = useState<any>(null);
+  const [normalizedRoadmapData, setNormalizedRoadmapData] = useState<any>(null);
+  const [previewNodes, setPreviewNodes] = useState<any[]>([]);
+  const [previewEdges, setPreviewEdges] = useState<any[]>([]);
+  
+  // Error / Recovery states (Section 3 & 6)
+  const [errorReason, setErrorReason] = useState("");
+  const [recoveredFromDraft, setRecoveredFromDraft] = useState(false);
+  const progressIntervalRef = useRef<any>(null);
+  const cancellationRef = useRef<boolean>(false);
+
+  // Save import draft to sessionStorage (Section 3)
+  useEffect(() => {
+    if (importState === 'idle' && isImportModalOpen) {
+      sessionStorage.setItem('roadmap-import-draft', JSON.stringify({
+        json: importText,
+        format: importFormat,
+        filename: importFilename,
+        targetRmId: importTargetRmId,
+        collisionAction
+      }));
+    }
+  }, [importText, importFormat, importFilename, importTargetRmId, collisionAction, importState, isImportModalOpen]);
+
+  // Recover import draft from sessionStorage (Section 3)
+  useEffect(() => {
+    if (isImportModalOpen && importState === 'idle') {
+      const saved = sessionStorage.getItem('roadmap-import-draft');
+      if (saved) {
+        try {
+          const draft = JSON.parse(saved);
+          if (draft.json) {
+            setImportText(draft.json);
+            setImportFormat(draft.format || 'native');
+            setImportFilename(draft.filename || "");
+            setImportTargetRmId(draft.targetRmId || null);
+            setCollisionAction(draft.collisionAction || 'duplicate');
+            setRecoveredFromDraft(true);
+            toast.success("Recovered previous import draft");
+          }
+        } catch (e) {
+          console.error("Import draft recovery failed", e);
+        }
+      }
+    }
+  }, [isImportModalOpen]);
+
+  // Clean up progress intervals on unmount
+  useEffect(() => {
+    return () => {
+      if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
+    };
+  }, []);
+
+  // Smooth progress increment loop (Section 1)
+  const startSmoothProgress = (targetMin: number, targetMax: number, durationMs: number) => {
+    if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
+    
+    const stepTime = 50; 
+    const steps = durationMs / stepTime;
+    const increment = (targetMax - targetMin) / steps;
+    let currentVal = targetMin;
+    
+    setImportProgress(Math.round(currentVal));
+    
+    progressIntervalRef.current = setInterval(() => {
+      currentVal = Math.min(currentVal + increment, targetMax);
+      setImportProgress(Math.round(currentVal));
+      if (currentVal >= targetMax) {
+        clearInterval(progressIntervalRef.current);
+      }
+    }, stepTime);
+  };
+
+  // Dry-run validation compiler (Section 7)
+  const handleDryRunValidation = () => {
+    if (!importText.trim()) {
+      setValidationOutput(null);
+      setNormalizedRoadmapData(null);
+      setPreviewNodes([]);
+      setPreviewEdges([]);
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(importText);
+      let normalized: any;
+      let detectedCounts: any = null;
+
+      // Auto-detect section-based JSON structure first! (Issue 1)
+      const isSectionBased = parsed && Array.isArray(parsed.sections);
+
+      if (isSectionBased) {
+        const normResult = normalizeSectionBased(parsed);
+        if (normResult) {
+          normalized = {
+            roadmap: normResult.roadmap,
+            nodes: normResult.nodes,
+            edges: normResult.edges
+          };
+          detectedCounts = normResult.detected;
+        } else {
+          throw new Error("Section-based roadmap normalization failed.");
+        }
+      } else if (importFormat === 'external') {
+        normalized = normalizeRoadmapSh(parsed);
+      } else {
+        const parseResult = nativeImportSchema.safeParse(parsed);
+        if (!parseResult.success) {
+          const errors = parseResult.error.errors.map(e => `${e.path.join('.')}: ${e.message}`);
+          setValidationOutput({
+            errors,
+            warnings: [],
+            ignoredFields: [],
+            nodeCount: parsed.nodes?.length || 0,
+            edgeCount: parsed.edges?.length || 0
+          });
+          setNormalizedRoadmapData(null);
+          setPreviewNodes([]);
+          setPreviewEdges([]);
+          return;
+        }
+        normalized = {
+          roadmap: parsed.roadmap,
+          nodes: parsed.nodes,
+          edges: parsed.edges
+        };
+      }
+
+      const valOut = validateGraph(normalized.nodes, normalized.edges);
+      setValidationOutput({
+        ...valOut,
+        detectedSections: detectedCounts?.sections,
+        detectedTopics: detectedCounts?.topics,
+        detectedSubtopics: detectedCounts?.subtopics
+      });
+      setNormalizedRoadmapData(normalized);
+
+      // Visual layout scaling for ReactFlow dry-run preview (Section 8)
+      const nodesForPreview = normalized.nodes.map((n: any) => ({
+        id: String(n.id),
+        type: 'default',
+        position: n.position || { x: 100, y: 100 },
+        data: { label: n.title },
+        style: { background: n.color || '#3b82f6', color: '#fff', border: 'none', borderRadius: '8px', fontSize: '8px', padding: '4px' }
+      }));
+
+      const edgesForPreview = normalized.edges.map((e: any, idx: number) => ({
+        id: e.id || `e-${idx}`,
+        source: String(e.source),
+        target: String(e.target),
+        animated: true,
+        style: { stroke: '#06b6d4' }
+      }));
+
+      setPreviewNodes(nodesForPreview);
+      setPreviewEdges(edgesForPreview);
+
+    } catch (err: any) {
+      setValidationOutput({
+        errors: [`Invalid JSON format: ${err.message}`],
+        warnings: [],
+        ignoredFields: [],
+        nodeCount: 0,
+        edgeCount: 0
+      });
+      setNormalizedRoadmapData(null);
+      setPreviewNodes([]);
+      setPreviewEdges([]);
+    }
+  };
+
+  useEffect(() => {
+    handleDryRunValidation();
+  }, [importText, importFormat]);
+
+  const clearDraftFromSession = () => {
+    sessionStorage.removeItem('roadmap-import-draft');
+  };
+
+  // Transaction execution pipeline (Section 5)
+  const handleExecuteImport = async () => {
+    if (!normalizedRoadmapData) return;
+    
+    const nodeCount = normalizedRoadmapData.nodes.length;
+    const edgeCount = normalizedRoadmapData.edges.length;
+
+    // Console logging stats (Issue 1)
+    console.log("Roadmap Import Execution details:", {
+      detectedSections: validationOutput?.detectedSections || 0,
+      generatedNodesCount: nodeCount,
+      generatedEdgesCount: edgeCount
+    });
+
+    if (nodeCount > 1000) {
+      toast.error("Import Blocked: Exceeds hard limit of 1000 nodes.");
+      return;
+    }
+
+    if (nodeCount > 300) {
+      const confirmLarge = window.confirm(`Large roadmap detected (${nodeCount} nodes). Validation and import will run in the background. Proceed?`);
+      if (!confirmLarge) return;
+    }
+
+    cancellationRef.current = false;
+    setImportState('validating');
+    startSmoothProgress(0, 20, 800);
+    await new Promise(r => setTimeout(r, 800));
+    if (cancellationRef.current) return;
+
+    setImportState('normalizing');
+    startSmoothProgress(20, 35, 600);
+    await new Promise(r => setTimeout(r, 600));
+    if (cancellationRef.current) return;
+
+    setImportState('building');
+    startSmoothProgress(35, 50, 600);
+    await new Promise(r => setTimeout(r, 600));
+    if (cancellationRef.current) return;
+
+    const targetRm = collisionAction === 'duplicate' ? null : importTargetRmId;
+    
+    // Concurrency Lock checks
+    if (targetRm) {
+      try {
+        const { data: rm, error: fetchRmError } = await supabase
+          .from('roadmaps')
+          .select('locked_by, locked_at, import_state, updated_at')
+          .eq('id', targetRm)
+          .single();
+          
+        if (fetchRmError) throw fetchRmError;
+        
+        if (rm) {
+          if (rm.import_state === 'importing') {
+            const now = new Date();
+            const importLockExpiry = 10 * 60 * 1000; // 10 mins stuck timeout
+            const isLockActive = now.getTime() - new Date(rm.locked_at || rm.updated_at).getTime() < importLockExpiry;
+            
+            if (isLockActive) {
+              setImportState('failed');
+              setErrorReason('An import is already actively running on this roadmap. Please wait or retry after 10 minutes.');
+              return;
+            } else {
+              const resetLock = window.confirm('A stuck import was detected (active for more than 10 mins). Would you like to force reset its lock and overwrite?');
+              if (!resetLock) {
+                setImportState('failed');
+                setErrorReason('Import aborted by user due to stuck lock.');
+                return;
+              }
+            }
+          }
+          
+          if (rm.locked_by && rm.locked_by !== adminUser.id) {
+            const now = new Date();
+            const lockExpiry = 5 * 60 * 1000; 
+            const isLockActive = now.getTime() - new Date(rm.locked_at).getTime() < lockExpiry;
+            
+            if (isLockActive) {
+              setImportState('failed');
+              setErrorReason('This roadmap is locked by another admin editing it.');
+              return;
+            }
+          }
+        }
+      } catch (err: any) {
+        setImportState('failed');
+        setErrorReason('Lock verification failed: ' + err.message);
+        return;
+      }
+    }
+
+    // Set database lock state
+    if (targetRm) {
+      try {
+        await supabase
+          .from('roadmaps')
+          .update({
+            import_state: 'importing',
+            locked_by: adminUser.id,
+            locked_at: new Date().toISOString()
+          })
+          .eq('id', targetRm);
+      } catch (e) {
+        console.error("DB locking failed", e);
+      }
+    }
+
+    setImportState('saving_nodes');
+    startSmoothProgress(50, 75, 1500);
+
+    const nodesArray = normalizedRoadmapData.nodes.map((n: any) => ({
+      id: n.id,
+      title: n.title,
+      description: n.description || "",
+      x: n.position?.x || 0,
+      y: n.position?.y || 0,
+      node_type: n.node_type || "topic",
+      color: n.color || "#3b82f6",
+      resources: n.resources || []
+    }));
+
+    const edgesArray = normalizedRoadmapData.edges.map((e: any) => ({
+      id: e.id || 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+        const r = Math.random() * 16 | 0;
+        const v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      }),
+      source: e.source,
+      target: e.target,
+      label: e.label || ""
+    }));
+
+    if (cancellationRef.current) {
+      if (targetRm) {
+        await supabase.from('roadmaps').update({ import_state: 'ready', locked_by: null, locked_at: null }).eq('id', targetRm);
+      }
+      setImportState('cancelled');
+      return;
+    }
+
+    setImportState('saving_edges');
+    startSmoothProgress(75, 90, 1200);
+    await new Promise(r => setTimeout(r, 600));
+
+    setImportState('finalizing');
+    startSmoothProgress(90, 99, 800);
+
+    try {
+      const { data: committedRoadmapId, error: rpcError } = await supabase.rpc('import_roadmap_transactional', {
+        p_roadmap_id: targetRm,
+        p_title: normalizedRoadmapData.roadmap.title,
+        p_description: normalizedRoadmapData.roadmap.description || "",
+        p_category: normalizedRoadmapData.roadmap.category || "Web Development",
+        p_difficulty: normalizedRoadmapData.roadmap.difficulty || "Intermediate",
+        p_estimated_duration: normalizedRoadmapData.roadmap.estimated_duration || "2 months",
+        p_is_published: normalizedRoadmapData.roadmap.is_published || false,
+        p_nodes: nodesArray,
+        p_edges: edgesArray,
+        p_import_mode: collisionAction === 'duplicate' ? 'duplicate' : collisionAction,
+        p_admin_id: adminUser.id,
+        p_import_metadata: {
+          import_source: importFilename || 'Pasted JSON Text',
+          import_type: importFormat,
+          imported_by: adminUser.email,
+          import_version: '1.0',
+          timestamp: new Date().toISOString(),
+          warnings_count: validationOutput?.warnings?.length || 0,
+          detected_sections_count: validationOutput?.detectedSections || 0,
+          generated_nodes_count: nodeCount,
+          generated_edges_count: edgeCount
+        }
+      });
+
+      if (rpcError) throw rpcError;
+
+      if (committedRoadmapId) {
+        await supabase.from('roadmaps').update({ import_state: 'ready', locked_by: null, locked_at: null }).eq('id', committedRoadmapId);
+      }
+
+      setImportProgress(100);
+      setImportState('success');
+      toast.success("Roadmap imported successfully!");
+      clearDraftFromSession();
+      setRecoveredFromDraft(false);
+      
+      const { data: logs } = await supabase
+        .from("admin_logs")
+        .select("*, profiles(name, email)")
+        .order("created_at", { ascending: false })
+        .limit(100);
+      setLogsList(logs || []);
+      
+      await loadRoadmaps();
+
+    } catch (err: any) {
+      console.error("Import transaction error:", err);
+      if (targetRm) {
+        await supabase.from('roadmaps').update({ import_state: 'failed', locked_by: null, locked_at: null }).eq('id', targetRm);
+      }
+      setImportState('failed');
+      setErrorReason(err.message || 'An unexpected database error occurred during saving.');
+    }
+  };
 
   useEffect(() => {
     const tab = searchParams.get("tab");
@@ -972,17 +1372,28 @@ function AdminContent() {
                 <TabsContent value="roadmaps">
                   <div className="flex justify-between items-center mb-6">
                     <h3 className="text-lg font-bold text-white">All Platform Roadmaps</h3>
-                    <Button
-                      onClick={() => {
-                        setEditingRoadmap(null);
-                        resetRoadmapForm();
-                        setIsRoadmapModalOpen(true);
-                      }}
-                      className="bg-violet-600 hover:bg-violet-500 text-white border-0 shadow-[0_0_15px_rgba(139,92,246,0.3)] cursor-pointer"
-                    >
-                      <Plus className="h-4 w-4 mr-2" />
-                      Create Roadmap
-                    </Button>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        onClick={() => {
+                          setIsImportModalOpen(true);
+                        }}
+                        className="bg-cyan-600 hover:bg-cyan-500 text-white border-0 shadow-[0_0_15px_rgba(6,182,212,0.3)] cursor-pointer"
+                      >
+                        <ArrowUp className="h-4 w-4 mr-2" />
+                        Import JSON
+                      </Button>
+                      <Button
+                        onClick={() => {
+                          setEditingRoadmap(null);
+                          resetRoadmapForm();
+                          setIsRoadmapModalOpen(true);
+                        }}
+                        className="bg-violet-600 hover:bg-violet-500 text-white border-0 shadow-[0_0_15px_rgba(139,92,246,0.3)] cursor-pointer"
+                      >
+                        <Plus className="h-4 w-4 mr-2" />
+                        Create Roadmap
+                      </Button>
+                    </div>
                   </div>
 
                   {/* Roadmaps List Table */}
@@ -1276,6 +1687,452 @@ function AdminContent() {
                       </Button>
                     </DialogFooter>
                   </form>
+                </DialogContent>
+              </Dialog>
+
+              {/* Import Roadmap JSON Dialog Modal */}
+              <Dialog open={isImportModalOpen} onOpenChange={(open) => {
+                if (importState === 'idle' || importState === 'success' || importState === 'failed' || importState === 'cancelled') {
+                  setIsImportModalOpen(open);
+                  if (!open) {
+                    setImportState('idle');
+                    setImportProgress(0);
+                    setErrorReason("");
+                    setRecoveredFromDraft(false);
+                  }
+                }
+              }}>
+                <DialogContent 
+                  className="bg-black/95 border border-white/10 text-white backdrop-blur-2xl max-w-3xl max-h-[85vh] overflow-y-auto shadow-[0_8px_32px_rgba(0,0,0,0.6)]"
+                  onPointerDownOutside={(e) => {
+                    if (importState !== 'idle' && importState !== 'success' && importState !== 'failed' && importState !== 'cancelled') {
+                      e.preventDefault();
+                    }
+                  }}
+                  onEscapeKeyDown={(e) => {
+                    if (importState !== 'idle' && importState !== 'success' && importState !== 'failed' && importState !== 'cancelled') {
+                      e.preventDefault();
+                    }
+                  }}
+                >
+                  <DialogHeader>
+                    <DialogTitle className="text-lg font-bold text-white flex items-center gap-2">
+                      <ArrowUp className="h-5 w-5 text-cyan-400" />
+                      JSON Roadmap Importer
+                    </DialogTitle>
+                  </DialogHeader>
+
+                  <Tabs defaultValue="import" className="w-full mt-4">
+                    <TabsList className="bg-white/5 border border-white/10 text-white/60 p-1 rounded-xl mb-4 gap-1">
+                      <TabsTrigger value="import" disabled={importState !== 'idle' && importState !== 'success' && importState !== 'failed' && importState !== 'cancelled'} className="data-[state=active]:bg-white/10 data-[state=active]:text-white rounded-lg px-4 py-2 text-xs">
+                        Import
+                      </TabsTrigger>
+                      <TabsTrigger value="history" disabled={importState !== 'idle' && importState !== 'success' && importState !== 'failed' && importState !== 'cancelled'} className="data-[state=active]:bg-white/10 data-[state=active]:text-white rounded-lg px-4 py-2 text-xs">
+                        Import History
+                      </TabsTrigger>
+                    </TabsList>
+
+                    <TabsContent value="import" className="space-y-4">
+                      {/* Draft Recovery Alert */}
+                      {recoveredFromDraft && importState === 'idle' && (
+                        <div className="p-3 rounded-lg border border-cyan-500/20 bg-cyan-500/10 text-cyan-200 text-xs flex justify-between items-center">
+                          <span>Recovered previous import draft.</span>
+                          <button 
+                            type="button" 
+                            onClick={() => {
+                              clearDraftFromSession();
+                              setImportText("");
+                              setImportFilename("");
+                              setRecoveredFromDraft(false);
+                            }}
+                            className="text-[10px] text-cyan-400 underline hover:text-cyan-300 cursor-pointer"
+                          >
+                            Discard Draft
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Idle State Form */}
+                      {importState === 'idle' && (
+                        <>
+                          <div className="grid grid-cols-2 gap-4">
+                            <div className="space-y-1.5">
+                              <Label className="text-white/70 text-xs">Import Mode</Label>
+                              <Select value={importFormat} onValueChange={(val: 'native' | 'external') => setImportFormat(val)}>
+                                <SelectTrigger className="bg-white/5 border-white/10 text-white">
+                                  <SelectValue placeholder="Format" />
+                                </SelectTrigger>
+                                <SelectContent className="bg-black border-white/10 text-white">
+                                  <SelectItem value="native" className="focus:bg-white/10 focus:text-white">Native JSON Export</SelectItem>
+                                  <SelectItem value="external" className="focus:bg-white/10 focus:text-white">roadmap.sh Compatible JSON</SelectItem>
+                                </SelectContent>
+                              </Select>
+                            </div>
+
+                            <div className="space-y-1.5">
+                              <Label className="text-white/70 text-xs">Collision Conflict Action</Label>
+                              <Select value={collisionAction} onValueChange={(val: 'overwrite' | 'merge' | 'duplicate') => setCollisionAction(val)}>
+                                <SelectTrigger className="bg-white/5 border-white/10 text-white">
+                                  <SelectValue placeholder="Collision Strategy" />
+                                </SelectTrigger>
+                                <SelectContent className="bg-black border-white/10 text-white">
+                                  <SelectItem value="duplicate" className="focus:bg-white/10 focus:text-white">Create Duplicate Copy</SelectItem>
+                                  <SelectItem value="overwrite" className="focus:bg-white/10 focus:text-white">Overwrite Matching Roadmap</SelectItem>
+                                  <SelectItem value="merge" className="focus:bg-white/10 focus:text-white">Merge & Update Nodes</SelectItem>
+                                </SelectContent>
+                              </Select>
+                            </div>
+                          </div>
+
+                          {collisionAction !== 'duplicate' && (
+                            <div className="space-y-1.5">
+                              <Label className="text-white/70 text-xs">Select Target Roadmap to Update</Label>
+                              <Select value={importTargetRmId || ""} onValueChange={(val) => setImportTargetRmId(val || null)}>
+                                <SelectTrigger className="bg-white/5 border-white/10 text-white">
+                                  <SelectValue placeholder="Choose Roadmap" />
+                                </SelectTrigger>
+                                <SelectContent className="bg-black border-white/10 text-white">
+                                  {roadmaps.map(rm => (
+                                    <SelectItem key={rm.id} value={rm.id} className="focus:bg-white/10 focus:text-white">
+                                      {rm.title} ({rm.category})
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                            </div>
+                          )}
+
+                          <div className="space-y-1.5">
+                            <Label className="text-white/70 text-xs">File Upload (Optional)</Label>
+                            <Input 
+                              type="file" 
+                              accept=".json"
+                              onChange={(e) => {
+                                const file = e.target.files?.[0];
+                                if (file) {
+                                  setImportFilename(file.name);
+                                  const reader = new FileReader();
+                                  reader.onload = (evt) => {
+                                    if (evt.target?.result) {
+                                      setImportText(evt.target.result as string);
+                                    }
+                                  };
+                                  reader.readAsText(file);
+                                }
+                              }}
+                              className="bg-white/5 border-white/10 text-white text-xs"
+                            />
+                          </div>
+
+                          <div className="space-y-1.5">
+                            <Label className="text-white/70 text-xs">Paste Raw JSON Roadmap Configuration</Label>
+                            <Textarea 
+                              rows={8}
+                              value={importText}
+                              onChange={(e) => setImportText(e.target.value)}
+                              placeholder="Paste JSON roadmap schema content here..."
+                              className="bg-white/5 border-white/10 text-white text-xs font-mono"
+                            />
+                          </div>
+
+                          {/* Dry-run validation output */}
+                          {validationOutput && (
+                            <div className="p-4 rounded-xl border border-white/10 bg-black/40 text-xs space-y-3">
+                              <div className="flex items-center justify-between border-b border-white/5 pb-2">
+                                <span className="font-bold text-white uppercase tracking-wider text-[10px]">Validation Dry-Run Summary</span>
+                                <div className="flex gap-3 text-[10px] text-white/50">
+                                  <span>Nodes: <strong className="text-cyan-400">{validationOutput.nodeCount}</strong></span>
+                                  <span>Edges: <strong className="text-cyan-400">{validationOutput.edgeCount}</strong></span>
+                                </div>
+                              </div>
+
+                              {validationOutput.detectedSections !== undefined && (
+                                <div className="grid grid-cols-2 gap-4 p-3 rounded-lg border border-white/5 bg-white/[0.02]">
+                                  <div className="space-y-1">
+                                    <div className="text-white/40 font-bold uppercase tracking-wider text-[9px]">Detected Hierarchy</div>
+                                    <div className="text-white/70 space-y-0.5 font-mono text-[10px]">
+                                      <div>Sections: <strong className="text-cyan-400">{validationOutput.detectedSections}</strong></div>
+                                      <div>Topics: <strong className="text-cyan-400">{validationOutput.detectedTopics}</strong></div>
+                                      <div>Subtopics: <strong className="text-cyan-400">{validationOutput.detectedSubtopics}</strong></div>
+                                    </div>
+                                  </div>
+                                  <div className="space-y-1">
+                                    <div className="text-white/40 font-bold uppercase tracking-wider text-[9px]">Generated Elements</div>
+                                    <div className="text-white/70 space-y-0.5 font-mono text-[10px]">
+                                      <div>Nodes: <strong className="text-cyan-400">{validationOutput.nodeCount}</strong></div>
+                                      <div>Edges: <strong className="text-cyan-400">{validationOutput.edgeCount}</strong></div>
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
+
+                              {validationOutput.errors.length > 0 ? (
+                                <div className="space-y-1">
+                                  <div className="font-semibold text-red-400 text-[10px] uppercase">Errors (Import Blocked)</div>
+                                  <ul className="list-disc list-inside text-red-300/80 space-y-0.5 pl-1 max-h-24 overflow-y-auto">
+                                    {validationOutput.errors.map((err: string, idx: number) => (
+                                      <li key={idx} className="truncate">{err}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              ) : (
+                                <div className="text-emerald-400 font-semibold text-[10px] uppercase flex items-center gap-1">
+                                  <Check className="h-3.5 w-3.5" /> Schema validated successfully!
+                                </div>
+                              )}
+
+                              {validationOutput.warnings.length > 0 && (
+                                <div className="space-y-1 pt-1 border-t border-white/[0.03]">
+                                  <div className="font-semibold text-amber-400 text-[10px] uppercase">Warnings</div>
+                                  <ul className="list-disc list-inside text-amber-300/80 space-y-0.5 pl-1 max-h-20 overflow-y-auto">
+                                    {validationOutput.warnings.map((warn: string, idx: number) => (
+                                      <li key={idx} className="truncate">{warn}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+
+                              {validationOutput.ignoredFields.length > 0 && (
+                                <div className="space-y-1 pt-1 border-t border-white/[0.03]">
+                                  <div className="font-semibold text-white/40 text-[10px] uppercase">Ignored Fields</div>
+                                  <ul className="list-disc list-inside text-white/40 space-y-0.5 pl-1 max-h-20 overflow-y-auto">
+                                    {validationOutput.ignoredFields.map((ign: string, idx: number) => (
+                                      <li key={idx} className="truncate">{ign}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+
+                              {/* Interactive Preview Graph */}
+                              {previewNodes.length > 0 && validationOutput.errors.length === 0 && (
+                                <div className="pt-2">
+                                  <span className="font-bold text-[10px] text-white/40 uppercase block mb-1">Flowchart Topology Preview</span>
+                                  <div className="h-40 border border-white/5 bg-black/80 rounded-lg overflow-hidden relative">
+                                    <ReactFlow 
+                                      nodes={previewNodes} 
+                                      edges={previewEdges}
+                                      fitView
+                                      nodesDraggable={false}
+                                      nodesConnectable={false}
+                                      zoomOnDoubleClick={false}
+                                      zoomOnScroll={false}
+                                      panOnDrag={false}
+                                    >
+                                      <Background color="#222" gap={10} size={1} />
+                                    </ReactFlow>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          <DialogFooter className="border-t border-white/10 pt-4 flex justify-end gap-2">
+                            <Button 
+                              variant="outline" 
+                              onClick={() => {
+                                setIsImportModalOpen(false);
+                                clearDraftFromSession();
+                                setImportText("");
+                                setImportFilename("");
+                                setRecoveredFromDraft(false);
+                              }}
+                              className="border-white/10 hover:bg-white/5 text-white/80"
+                            >
+                              Cancel
+                            </Button>
+                            <Button 
+                              onClick={handleExecuteImport}
+                              disabled={!normalizedRoadmapData || (validationOutput?.errors?.length || 0) > 0}
+                              className="bg-cyan-600 hover:bg-cyan-500 text-white border-0 cursor-pointer disabled:opacity-30 disabled:pointer-events-none"
+                            >
+                              Confirm Import
+                            </Button>
+                          </DialogFooter>
+                        </>
+                      )}
+
+                      {/* Active Progress & Execution state */}
+                      {importState !== 'idle' && importState !== 'success' && importState !== 'failed' && importState !== 'cancelled' && (
+                        <div className="flex flex-col items-center justify-center py-12 text-center space-y-6">
+                          <span className="text-base font-bold text-white animate-pulse uppercase tracking-widest">
+                            {importState === 'validating' && 'Validating...'}
+                            {importState === 'normalizing' && 'Normalizing...'}
+                            {importState === 'building' && 'Building Graph...'}
+                            {importState === 'saving_nodes' && 'Saving Nodes...'}
+                            {importState === 'saving_edges' && 'Saving Edges...'}
+                            {importState === 'finalizing' && 'Finalizing...'}
+                          </span>
+
+                          <div className="text-xs text-white/40 font-mono">
+                            Nodes: {normalizedRoadmapData?.nodes?.length || 0} | Edges: {normalizedRoadmapData?.edges?.length || 0}
+                          </div>
+
+                          <Progress value={importProgress} className="w-[60%]" />
+
+                          <div className="text-xs font-mono text-cyan-400 font-bold">{importProgress}%</div>
+
+                          {/* Cancellation button */}
+                          <div className="pt-4">
+                            {['validating', 'normalizing', 'building'].includes(importState) ? (
+                              <Button 
+                                variant="outline" 
+                                onClick={() => {
+                                  cancellationRef.current = true;
+                                  setImportState('cancelled');
+                                  toast.info("Import cancelled by user");
+                                }}
+                                className="border-red-500/30 bg-red-500/10 text-red-400 hover:bg-red-500/20 text-xs px-4"
+                              >
+                                Cancel Import
+                              </Button>
+                            ) : (
+                              <div className="text-[10px] text-white/30 italic">
+                                Waiting for database transaction to complete... (Cannot cancel active commit)
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Success State */}
+                      {importState === 'success' && (
+                        <div className="flex flex-col items-center justify-center py-10 text-center space-y-5">
+                          <div className="h-12 w-12 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400 text-2xl font-bold">
+                            ✓
+                          </div>
+                          <h3 className="text-lg font-bold text-white font-display">Done</h3>
+                          <div className="text-sm text-white/60 max-w-md">
+                            Successfully persisted roadmap graph to database.
+                          </div>
+                          <div className="p-3 bg-white/5 border border-white/10 rounded-lg text-xs font-mono text-white/80 space-y-1 min-w-[200px]">
+                            <div>Nodes: {normalizedRoadmapData?.nodes?.length || 0}</div>
+                            <div>Edges: {normalizedRoadmapData?.edges?.length || 0}</div>
+                          </div>
+                          <Button 
+                            onClick={() => {
+                              setIsImportModalOpen(false);
+                              setImportState('idle');
+                              setImportText("");
+                              setImportFilename("");
+                              setNormalizedRoadmapData(null);
+                            }}
+                            className="bg-emerald-600 hover:bg-emerald-500 text-white border-0 text-xs px-6"
+                          >
+                            Finish
+                          </Button>
+                        </div>
+                      )}
+
+                      {/* Cancelled State */}
+                      {importState === 'cancelled' && (
+                        <div className="flex flex-col items-center justify-center py-10 text-center space-y-5">
+                          <div className="text-red-400 text-lg font-bold">Import Cancelled</div>
+                          <p className="text-xs text-white/50 max-w-sm">The import pipeline was halted, and database write locks have been safely released.</p>
+                          <Button 
+                            onClick={() => setImportState('idle')}
+                            className="bg-white/10 hover:bg-white/20 text-white border-0 text-xs px-4"
+                          >
+                            Dismiss
+                          </Button>
+                        </div>
+                      )}
+
+                      {/* Failure State */}
+                      {importState === 'failed' && (
+                        <div className="flex flex-col items-center justify-center py-10 text-center space-y-5">
+                          <div className="h-12 w-12 rounded-full bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-400 text-xl font-bold">
+                            ✕
+                          </div>
+                          <h3 className="text-lg font-bold text-white">Import Failed</h3>
+                          <div className="text-xs text-red-400 bg-red-950/20 border border-red-900/30 p-3 rounded-lg max-w-md font-mono whitespace-pre-wrap leading-normal text-left">
+                            {errorReason}
+                          </div>
+                          <div className="flex gap-2">
+                            <Button 
+                              variant="outline" 
+                              onClick={() => {
+                                setImportState('idle');
+                                setErrorReason("");
+                              }}
+                              className="border-white/10 hover:bg-white/5 text-white/80 text-xs"
+                            >
+                              Back
+                            </Button>
+                            <Button 
+                              onClick={handleExecuteImport}
+                              className="bg-cyan-600 hover:bg-cyan-500 text-white border-0 text-xs px-6"
+                            >
+                              Retry Import
+                            </Button>
+                          </div>
+                        </div>
+                      )}
+                    </TabsContent>
+
+                    {/* Import History Panel */}
+                    <TabsContent value="history">
+                      <div className="rounded-xl border border-white/[0.08] bg-black/40 overflow-hidden text-xs">
+                        <Table>
+                          <TableHeader className="bg-white/5 border-b border-white/10">
+                            <TableRow className="hover:bg-transparent">
+                              <TableHead className="text-white/60">Import Date</TableHead>
+                              <TableHead className="text-white/60">Roadmap Title</TableHead>
+                              <TableHead className="text-white/60">Source Type</TableHead>
+                              <TableHead className="text-white/60">Nodes</TableHead>
+                              <TableHead className="text-white/60">Edges</TableHead>
+                              <TableHead className="text-white/60">Warnings</TableHead>
+                              <TableHead className="text-white/60">Admin User</TableHead>
+                            </TableRow>
+                          </TableHeader>
+                          <TableBody>
+                            {logsList.filter(log => log.action === 'import_roadmap').length === 0 ? (
+                              <TableRow>
+                                <TableCell colSpan={7} className="text-center text-white/40 py-8">
+                                  No previous JSON roadmap imports logged.
+                                </TableCell>
+                              </TableRow>
+                            ) : (
+                              logsList
+                                .filter(log => log.action === 'import_roadmap')
+                                .map((log) => {
+                                  const details = log.details || {};
+                                  return (
+                                    <TableRow key={log.id} className="border-b border-white/[0.05] hover:bg-white/[0.02]">
+                                      <TableCell className="text-white/40 font-mono">
+                                        {new Date(log.created_at).toLocaleString()}
+                                      </TableCell>
+                                      <TableCell className="font-semibold text-white">
+                                        {details.title || 'Unknown'}
+                                      </TableCell>
+                                      <TableCell className="uppercase font-semibold text-[10px] text-cyan-400">
+                                        {details.source_type || 'native'}
+                                      </TableCell>
+                                      <TableCell className="font-bold text-white/80">{details.nodes_count || 0}</TableCell>
+                                      <TableCell className="font-bold text-white/80">{details.edges_count || 0}</TableCell>
+                                      <TableCell className={details.warnings_count > 0 ? "text-amber-400" : "text-white/40"}>
+                                        {details.warnings_count || 0}
+                                      </TableCell>
+                                      <TableCell className="text-white/60">
+                                        {log.profiles?.name || log.profiles?.email || log.admin_id}
+                                      </TableCell>
+                                    </TableRow>
+                                  );
+                                })
+                            )}
+                          </TableBody>
+                        </Table>
+                      </div>
+                      <div className="pt-4 flex justify-end">
+                        <Button 
+                          variant="outline" 
+                          onClick={() => setIsImportModalOpen(false)}
+                          className="border-white/10 hover:bg-white/5 text-white/80 text-xs"
+                        >
+                          Close History
+                        </Button>
+                      </div>
+                    </TabsContent>
+                  </Tabs>
                 </DialogContent>
               </Dialog>
             </div>

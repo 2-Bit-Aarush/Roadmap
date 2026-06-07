@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, use } from "react";
+import React, { useState, useEffect, use, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { Navbar } from "@/components/navbar";
@@ -25,6 +25,12 @@ import {
   Sparkles,
   ChevronRight,
   TrendingUp,
+  LayoutGrid,
+  Search,
+  SlidersHorizontal,
+  Filter,
+  Map,
+  List
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -34,7 +40,9 @@ import {
   MarkerType,
   Position,
   Handle,
-  NodeProps
+  NodeProps,
+  ReactFlowProvider,
+  useReactFlow
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 
@@ -43,6 +51,14 @@ interface RoadmapPageProps {
 }
 
 export default function RoadmapPage({ params }: RoadmapPageProps) {
+  return (
+    <ReactFlowProvider>
+      <RoadmapPageContent params={params} />
+    </ReactFlowProvider>
+  );
+}
+
+function RoadmapPageContent({ params }: RoadmapPageProps) {
   const router = useRouter();
   const resolvedParams = use(params);
   const roadmapId = resolvedParams.id;
@@ -57,6 +73,37 @@ export default function RoadmapPage({ params }: RoadmapPageProps) {
   const [isBookmarked, setIsBookmarked] = useState(false);
   const [activeNode, setActiveNode] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+
+  // Dual View Mode & Filtering States
+  const [viewMode, setViewMode] = useState<"roadmap" | "title">("roadmap");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [completionStatus, setCompletionStatus] = useState("all");
+  const [categoryType, setCategoryType] = useState("all");
+  const [sortBy, setSortBy] = useState("default");
+  
+  // Collapse States (Issue 2)
+  const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
+  const [collapsedTopics, setCollapsedTopics] = useState<Record<string, boolean>>({});
+  const [highlightedNodeId, setHighlightedNodeId] = useState<string | null>(null);
+
+  const reactFlowInstance = useReactFlow();
+
+  // Load view mode preference from localStorage
+  useEffect(() => {
+    if (typeof window !== "undefined" && roadmapId) {
+      const saved = localStorage.getItem(`roadmap-viewmode-${roadmapId}`);
+      if (saved === "title" || saved === "roadmap") {
+        setViewMode(saved);
+      }
+    }
+  }, [roadmapId]);
+
+  const handleViewModeChange = (mode: "roadmap" | "title") => {
+    setViewMode(mode);
+    if (typeof window !== "undefined" && roadmapId) {
+      localStorage.setItem(`roadmap-viewmode-${roadmapId}`, mode);
+    }
+  };
 
   useEffect(() => {
     async function initPage() {
@@ -273,9 +320,9 @@ export default function RoadmapPage({ params }: RoadmapPageProps) {
             )}
           </div>
           <div className="font-bold text-xs truncate pr-4 text-white/95">{data.label as string}</div>
-          {data.description && (
+          {typeof data.description === "string" && data.description && (
             <div className="text-[9px] text-white/40 line-clamp-2 mt-1 leading-normal font-normal">
-              {data.description as string}
+              {data.description}
             </div>
           )}
           <Handle type="source" position={Position.Bottom} className="!bg-cyan-400 !w-2 !h-2 !opacity-0 pointer-events-none" />
@@ -288,6 +335,7 @@ export default function RoadmapPage({ params }: RoadmapPageProps) {
     id: n.id,
     type: "customNode",
     position: { x: Number(n.x_position), y: Number(n.y_position) },
+    selected: n.id === highlightedNodeId || (activeNode && activeNode.id === n.id),
     data: {
       label: n.title,
       description: n.description || "",
@@ -315,7 +363,309 @@ export default function RoadmapPage({ params }: RoadmapPageProps) {
     const original = nodes.find((n) => n.id === node.id);
     if (original) {
       setActiveNode(original);
+      setHighlightedNodeId(original.id);
     }
+  };
+
+  const focusOnNode = (node: any) => {
+    setActiveNode(node);
+    setViewMode("roadmap");
+    setHighlightedNodeId(node.id);
+
+    setTimeout(() => {
+      try {
+        const x = Number(node.x_position || 0);
+        const y = Number(node.y_position || 0);
+        reactFlowInstance.setCenter(x + 100, y + 40, { zoom: 1.1, duration: 800 });
+      } catch (e) {
+        console.warn("Failed to focus React Flow node:", e);
+      }
+    }, 100);
+  };
+
+  // Unique types computed for node type filter
+  const uniqueTypes = useMemo(() => {
+    const types = new Set<string>();
+    nodes.forEach((n) => {
+      if (n.node_type) types.add(n.node_type);
+    });
+    return Array.from(types);
+  }, [nodes]);
+
+  // Build the complete hierarchical tree from priority mapping sources (Issue 2)
+  const buildHierarchy = () => {
+    const parentMap = new globalThis.Map<string, string>(); // childId -> parentId
+
+    // Build parent-child relationships from edges (Priority 2)
+    edges.forEach((edge) => {
+      if (edge.source_node_id && edge.target_node_id) {
+        parentMap.set(edge.target_node_id, edge.source_node_id);
+      } else if (edge.source && edge.target) {
+        parentMap.set(edge.target, edge.source);
+      }
+    });
+
+    // Build parent-child relationships from node metadata (Priority 3)
+    nodes.forEach((node) => {
+      if (node.metadata && typeof node.metadata === "object") {
+        const parentId = node.metadata.parent_id || node.metadata.parent || node.metadata.parentId;
+        if (parentId) {
+          parentMap.set(node.id, String(parentId));
+        }
+      }
+    });
+
+    interface HierarchicalNode {
+      node: any;
+      subtopics: HierarchicalNode[];
+    }
+
+    interface HierarchicalSection {
+      id: string;
+      title: string;
+      description?: string;
+      topics: HierarchicalNode[];
+    }
+
+    const result: HierarchicalSection[] = [];
+    const placedNodeIds = new Set<string>();
+
+    // 1. Database Sections (Priority 1)
+    if (sections && sections.length > 0) {
+      sections.forEach((sec) => {
+        const secNodes = nodes.filter((n) => n.section_id === sec.id);
+        const topics: HierarchicalNode[] = [];
+
+        // Identify top-level topics in this section: no parent, or parent not in this section, and not subtopic type
+        secNodes.forEach((node) => {
+          const hasParentInSec = parentMap.has(node.id) && secNodes.some((n) => n.id === parentMap.get(node.id));
+          if (!hasParentInSec && node.node_type !== "subtopic") {
+            topics.push({ node, subtopics: [] });
+            placedNodeIds.add(node.id);
+          }
+        });
+
+        // Match subtopics to their parent topics
+        secNodes.forEach((node) => {
+          if (node.node_type === "subtopic" || parentMap.has(node.id)) {
+            const parentId = parentMap.get(node.id);
+            const parentTopic = topics.find((t) => t.node.id === parentId);
+            if (parentTopic) {
+              parentTopic.subtopics.push({ node, subtopics: [] });
+              placedNodeIds.add(node.id);
+            }
+          }
+        });
+
+        // Place any remaining nodes in this section that were skipped
+        secNodes.forEach((node) => {
+          if (!placedNodeIds.has(node.id)) {
+            if (topics.length > 0) {
+              topics[0].subtopics.push({ node, subtopics: [] });
+            } else {
+              topics.push({ node, subtopics: [] });
+            }
+            placedNodeIds.add(node.id);
+          }
+        });
+
+        result.push({
+          id: sec.id,
+          title: sec.title,
+          description: sec.description || "",
+          topics
+        });
+      });
+    }
+
+    // 2. Flowchart Section Nodes (Priority 1)
+    const flowchartSectionNodes = nodes.filter((n) => n.node_type === "section");
+    if (flowchartSectionNodes.length > 0) {
+      flowchartSectionNodes.forEach((secNode) => {
+        const topics: HierarchicalNode[] = [];
+        placedNodeIds.add(secNode.id);
+
+        // Find topics linked to this section node
+        nodes.forEach((node) => {
+          if (node.node_type === "topic" && parentMap.get(node.id) === secNode.id) {
+            topics.push({ node, subtopics: [] });
+            placedNodeIds.add(node.id);
+          }
+        });
+
+        // Find subtopics linked to these topics
+        nodes.forEach((node) => {
+          if (node.node_type === "subtopic") {
+            const parentId = parentMap.get(node.id);
+            const parentTopic = topics.find((t) => t.node.id === parentId);
+            if (parentTopic) {
+              parentTopic.subtopics.push({ node, subtopics: [] });
+              placedNodeIds.add(node.id);
+            }
+          }
+        });
+
+        result.push({
+          id: secNode.id,
+          title: secNode.title,
+          description: secNode.description || "",
+          topics
+        });
+      });
+    }
+
+    // 3. Fallback: group any nodes not placed in any section yet under a "General" section (Priority 4)
+    const unplacedNodes = nodes.filter((n) => !placedNodeIds.has(n.id) && n.node_type !== "section");
+    if (unplacedNodes.length > 0) {
+      const generalTopics: HierarchicalNode[] = [];
+
+      // Find top-level unplaced nodes (topics)
+      const unplacedTopics = unplacedNodes.filter((n) => n.node_type === "topic" || !parentMap.has(n.id));
+      unplacedTopics.forEach((node) => {
+        generalTopics.push({ node, subtopics: [] });
+        placedNodeIds.add(node.id);
+      });
+
+      // Match remaining subtopics
+      unplacedNodes.forEach((node) => {
+        if (!placedNodeIds.has(node.id)) {
+          const parentId = parentMap.get(node.id);
+          const parentTopic = generalTopics.find((t) => t.node.id === parentId);
+          if (parentTopic) {
+            parentTopic.subtopics.push({ node, subtopics: [] });
+            placedNodeIds.add(node.id);
+          }
+        }
+      });
+
+      // Place remaining orphans
+      unplacedNodes.forEach((node) => {
+        if (!placedNodeIds.has(node.id)) {
+          if (generalTopics.length > 0) {
+            generalTopics[0].subtopics.push({ node, subtopics: [] });
+          } else {
+            generalTopics.push({ node, subtopics: [] });
+          }
+          placedNodeIds.add(node.id);
+        }
+      });
+
+      if (generalTopics.length > 0) {
+        result.push({
+          id: "general",
+          title: "General Topics",
+          description: "Topics that are not assigned to a specific section.",
+          topics: generalTopics
+        });
+      }
+    }
+
+    return result;
+  };
+
+  // Filter hierarchy dynamically based on searchQuery, completionStatus, and categoryType (Issue 2 Search)
+  const filteredHierarchy = useMemo(() => {
+    const rawHierarchy = buildHierarchy();
+
+    return rawHierarchy.map((sec) => {
+      const filteredTopics = sec.topics.map((t) => {
+        // Filter subtopics of this topic
+        const filteredSubtopics = t.subtopics.filter((sub) => {
+          const matchesSearch =
+            searchQuery === "" ||
+            sub.node.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+            (sub.node.description &&
+              sub.node.description.toLowerCase().includes(searchQuery.toLowerCase()));
+
+          const isDone = completedNodes.includes(sub.node.id);
+          const matchesStatus =
+            completionStatus === "all" ||
+            (completionStatus === "completed" && isDone) ||
+            (completionStatus === "incomplete" && !isDone);
+
+          const matchesType =
+            categoryType === "all" || sub.node.node_type === categoryType;
+
+          return matchesSearch && matchesStatus && matchesType;
+        });
+
+        // Filter topic itself
+        const matchesSearch =
+          searchQuery === "" ||
+          t.node.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+          (t.node.description &&
+            t.node.description.toLowerCase().includes(searchQuery.toLowerCase()));
+
+        const isDone = completedNodes.includes(t.node.id);
+        const matchesStatus =
+          completionStatus === "all" ||
+          (completionStatus === "completed" && isDone) ||
+          (completionStatus === "incomplete" && !isDone);
+
+        const matchesType =
+          categoryType === "all" || t.node.node_type === categoryType;
+
+        const isTopicMatch = matchesSearch && matchesStatus && matchesType;
+
+        // Keep topic if it matches directly OR if it has matching subtopics
+        const shouldKeepTopic = isTopicMatch || filteredSubtopics.length > 0;
+
+        if (shouldKeepTopic) {
+          return {
+            node: t.node,
+            subtopics: filteredSubtopics
+          };
+        }
+        return null;
+      }).filter(Boolean) as any[];
+
+      return {
+        ...sec,
+        topics: filteredTopics
+      };
+    }).filter((sec) => sec.topics.length > 0);
+  }, [nodes, edges, sections, searchQuery, completionStatus, categoryType, completedNodes]);
+
+  // Sort hierarchy dynamically (Issue 2 Sorting Options)
+  const sortedHierarchy = useMemo(() => {
+    const copy = [...filteredHierarchy];
+
+    const sortNodes = (a: any, b: any) => {
+      if (sortBy === "alphabetical") {
+        return a.title.localeCompare(b.title);
+      } else if (sortBy === "vertical") {
+        return Number(a.y_position || 0) - Number(b.y_position || 0);
+      } else {
+        const orderA = a.order_index !== undefined && a.order_index !== null ? a.order_index : 0;
+        const orderB = b.order_index !== undefined && b.order_index !== null ? b.order_index : 0;
+        if (orderA !== orderB) return orderA - orderB;
+        return Number(a.y_position || 0) - Number(b.y_position || 0);
+      }
+    };
+
+    return copy.map((sec) => {
+      const sortedTopics = [...sec.topics].sort((a, b) => sortNodes(a.node, b.node));
+      const sortedTopicsWithSortedSubtopics = sortedTopics.map((t) => {
+        const sortedSub = [...t.subtopics].sort((a, b) => sortNodes(a.node, b.node));
+        return {
+          ...t,
+          subtopics: sortedSub
+        };
+      });
+
+      return {
+        ...sec,
+        topics: sortedTopicsWithSortedSubtopics
+      };
+    });
+  }, [filteredHierarchy, sortBy]);
+
+  const toggleSection = (secId: string) => {
+    setCollapsedSections((prev) => ({ ...prev, [secId]: !prev[secId] }));
+  };
+
+  const toggleTopicCollapse = (topId: string) => {
+    setCollapsedTopics((prev) => ({ ...prev, [topId]: !prev[topId] }));
   };
 
   // Percent calculation
@@ -436,105 +786,469 @@ export default function RoadmapPage({ params }: RoadmapPageProps) {
                 <Progress value={progressPercent} className="h-2 bg-white/10" />
               </div>
 
-              {/* Learning Sections Flow */}
-              {roadmap.schema_version === "v2" ? (
-                <div className="h-[60vh] border border-white/10 rounded-2xl bg-[#050505] overflow-hidden relative mb-12 shadow-[0_8px_32px_rgba(0,0,0,0.5)]">
-                  <ReactFlow
-                    nodes={flowchartNodes}
-                    edges={flowchartEdges}
-                    nodeTypes={customNodeTypes}
-                    onNodeClick={handleStudentNodeClick}
-                    fitView
-                    minZoom={0.2}
-                    maxZoom={1.5}
-                    nodesConnectable={false}
-                    nodesDraggable={false}
-                    zoomOnDoubleClick={false}
-                  >
-                    <Background color="#333" gap={15} size={1} />
-                    <Controls className="!bg-black/80 !border-white/10 !rounded-lg overflow-hidden [&_button]:!bg-transparent [&_button]:!border-white/5 [&_svg]:!fill-white/70" />
-                  </ReactFlow>
+              {/* View Control Bar */}
+              {roadmap.schema_version === "v2" && (
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6 pb-6 border-b border-white/10">
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant={viewMode === "roadmap" ? "default" : "outline"}
+                      onClick={() => handleViewModeChange("roadmap")}
+                      className={cn(
+                        "gap-2 cursor-pointer h-10 px-4 rounded-xl transition-all duration-300",
+                        viewMode === "roadmap"
+                          ? "bg-cyan-500 hover:bg-cyan-600 text-black font-semibold shadow-[0_0_15px_rgba(6,180,212,0.4)]"
+                          : "border-white/10 text-white/80 hover:bg-white/5"
+                      )}
+                    >
+                      <Map className="h-4 w-4" />
+                      <span>Flowchart View</span>
+                    </Button>
+                    <Button
+                      variant={viewMode === "title" ? "default" : "outline"}
+                      onClick={() => handleViewModeChange("title")}
+                      className={cn(
+                        "gap-2 cursor-pointer h-10 px-4 rounded-xl transition-all duration-300",
+                        viewMode === "title"
+                          ? "bg-cyan-500 hover:bg-cyan-600 text-black font-semibold shadow-[0_0_15px_rgba(6,180,212,0.4)]"
+                          : "border-white/10 text-white/80 hover:bg-white/5"
+                      )}
+                    >
+                      <List className="h-4 w-4" />
+                      <span>Card View</span>
+                    </Button>
+                  </div>
                 </div>
-              ) : sections.length === 0 ? (
-                <div className="border border-dashed border-white/10 rounded-2xl p-12 text-center text-white/40 text-sm">
-                  This roadmap does not have any sections yet.
-                </div>
-              ) : (
-                <div className="space-y-12">
-                  {sections.map((section, sIndex) => {
-                    const sectionNodes = nodes.filter((n) => n.section_id === section.id);
+              )}
 
-                    return (
-                      <div key={section.id} className="relative">
-                        {/* Section Node connector line */}
-                        {sIndex < sections.length - 1 && (
-                          <div className="absolute left-6 top-16 bottom-0 w-0.5 bg-gradient-to-b from-white/10 to-transparent pointer-events-none" />
-                        )}
+              {/* Learning Content Selector */}
+              {viewMode === "title" ? (
+                <div className="space-y-6">
+                  {/* Filter panel */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3 p-4 rounded-xl border border-white/[0.08] bg-black/40 backdrop-blur-xl mb-6 shadow-lg">
+                    {/* Search query */}
+                    <div className="flex flex-col gap-1.5">
+                      <span className="text-[10px] uppercase tracking-wider text-white/40 font-bold flex items-center gap-1">
+                        <Search className="h-3 w-3 text-cyan-400" />
+                        Search Topics
+                      </span>
+                      <input
+                        type="text"
+                        placeholder="Search..."
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        className="bg-white/5 border border-white/10 hover:border-white/20 focus:border-cyan-500 rounded-lg px-3 py-1.5 text-white text-xs transition-colors duration-200 outline-none"
+                      />
+                    </div>
 
-                        <div className="flex gap-4">
-                          {/* Number badge */}
-                          <div className="h-12 w-12 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-white font-bold shrink-0 z-10">
-                            {sIndex + 1}
-                          </div>
+                    {/* Completion status */}
+                    <div className="flex flex-col gap-1.5">
+                      <span className="text-[10px] uppercase tracking-wider text-white/40 font-bold flex items-center gap-1">
+                        <CheckCircle className="h-3 w-3 text-cyan-400" />
+                        Status
+                      </span>
+                      <select
+                        value={completionStatus}
+                        onChange={(e) => setCompletionStatus(e.target.value)}
+                        className="bg-white/5 border border-white/10 hover:border-white/20 focus:border-cyan-500 rounded-lg px-3 py-1.5 text-white text-xs transition-colors duration-200 outline-none cursor-pointer"
+                      >
+                        <option value="all" className="bg-[#0c0c0c] text-white">All Status</option>
+                        <option value="completed" className="bg-[#0c0c0c] text-white">Completed</option>
+                        <option value="incomplete" className="bg-[#0c0c0c] text-white">Incomplete</option>
+                      </select>
+                    </div>
 
-                          <div className="flex-1">
-                            <div className="mb-6 pt-2">
-                              <h2 className="text-xl font-bold text-white mb-1" style={{ fontFamily: "var(--font-display)" }}>
-                                {section.title}
-                              </h2>
-                              {section.description && (
-                                <p className="text-white/40 text-sm">{section.description}</p>
-                              )}
+                    {/* Node Type filter */}
+                    <div className="flex flex-col gap-1.5">
+                      <span className="text-[10px] uppercase tracking-wider text-white/40 font-bold flex items-center gap-1">
+                        <Filter className="h-3 w-3 text-cyan-400" />
+                        Type
+                      </span>
+                      <select
+                        value={categoryType}
+                        onChange={(e) => setCategoryType(e.target.value)}
+                        className="bg-white/5 border border-white/10 hover:border-white/20 focus:border-cyan-500 rounded-lg px-3 py-1.5 text-white text-xs transition-colors duration-200 outline-none cursor-pointer"
+                      >
+                        <option value="all" className="bg-[#0c0c0c] text-white">All Types</option>
+                        {uniqueTypes.map((type) => (
+                          <option key={type} value={type} className="bg-[#0c0c0c] text-white">
+                            {type.charAt(0).toUpperCase() + type.slice(1)}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* Sort By */}
+                    <div className="flex flex-col gap-1.5">
+                      <span className="text-[10px] uppercase tracking-wider text-white/40 font-bold flex items-center gap-1">
+                        <SlidersHorizontal className="h-3 w-3 text-cyan-400" />
+                        Sort By
+                      </span>
+                      <select
+                        value={sortBy}
+                        onChange={(e) => setSortBy(e.target.value)}
+                        className="bg-white/5 border border-white/10 hover:border-white/20 focus:border-cyan-500 rounded-lg px-3 py-1.5 text-white text-xs transition-colors duration-200 outline-none cursor-pointer"
+                      >
+                        <option value="default" className="bg-[#0c0c0c] text-white">Default Sequence</option>
+                        <option value="alphabetical" className="bg-[#0c0c0c] text-white">Alphabetical (A-Z)</option>
+                        <option value="vertical" className="bg-[#0c0c0c] text-white">Stage Order (Top-Down)</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Hierarchical sections list (Issue 2) */}
+                  {sortedHierarchy.length === 0 ? (
+                    <div className="border border-dashed border-white/10 rounded-2xl p-12 text-center text-white/40 text-sm bg-black/40">
+                      No topics matched your active filters.
+                    </div>
+                  ) : (
+                    <div className="space-y-4 mb-12">
+                      {sortedHierarchy.map((sec: any) => {
+                        const isCollapsed = !!collapsedSections[sec.id];
+                        
+                        // Calculate stats for this section (Issue 2)
+                        let totalInSec = 0;
+                        let completedInSec = 0;
+                        sec.topics.forEach((t: any) => {
+                          totalInSec++;
+                          if (completedNodes.includes(t.node.id)) completedInSec++;
+                          t.subtopics.forEach((s: any) => {
+                            totalInSec++;
+                            if (completedNodes.includes(s.node.id)) completedInSec++;
+                          });
+                        });
+                        const percentCompleted = totalInSec > 0 ? Math.round((completedInSec / totalInSec) * 100) : 0;
+
+                        return (
+                          <div key={sec.id} className="border border-white/10 rounded-xl overflow-hidden bg-black/25">
+                            {/* Section Header */}
+                            <div
+                              onClick={() => toggleSection(sec.id)}
+                              className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white/[0.02] hover:bg-white/[0.04] transition-colors duration-200 cursor-pointer border-b border-white/[0.05]"
+                            >
+                              <div className="flex items-center gap-3">
+                                <motion.div
+                                  animate={{ rotate: isCollapsed ? 0 : 90 }}
+                                  transition={{ duration: 0.2 }}
+                                  className="text-white/60 font-bold"
+                                >
+                                  <ChevronRight className="h-4 w-4" />
+                                </motion.div>
+                                <span className="font-bold text-sm text-white tracking-wide">{sec.title}</span>
+                                <span className="text-xs text-white/40">({totalInSec} topics)</span>
+                              </div>
+                              <div className="flex items-center gap-3">
+                                <span className="text-xs text-cyan-400 font-bold">
+                                  {completedInSec}/{totalInSec} Completed ({percentCompleted}%)
+                                </span>
+                                <div className="w-24 bg-white/10 h-1.5 rounded-full overflow-hidden">
+                                  <div
+                                    className="bg-cyan-500 h-full transition-all duration-300"
+                                    style={{ width: `${percentCompleted}%` }}
+                                  />
+                                </div>
+                              </div>
                             </div>
 
-                            {/* Section topics list */}
-                            {sectionNodes.length === 0 ? (
-                              <p className="text-white/30 text-xs italic">No topics inside this section yet.</p>
-                            ) : (
-                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                                {sectionNodes.map((node) => {
-                                  const isDone = completedNodes.includes(node.id);
+                            {/* Section Content */}
+                            {!isCollapsed && (
+                              <div className="p-4 bg-transparent space-y-4">
+                                {sec.topics.map((t: any) => {
+                                  const isTopicDone = completedNodes.includes(t.node.id);
+                                  const topicColor = t.node.color || "#3b82f6";
+                                  const isTopicCollapsed = !!collapsedTopics[t.node.id];
+                                  const hasSubtopics = t.subtopics.length > 0;
 
                                   return (
-                                    <motion.div
-                                      key={node.id}
-                                      whileHover={{ scale: 1.01 }}
-                                      onClick={() => setActiveNode(node)}
-                                      className={cn(
-                                        "p-4 rounded-xl border flex items-center justify-between gap-3 cursor-pointer transition-all duration-300",
-                                        isDone
-                                          ? "bg-cyan-950/20 border-cyan-500/30 text-cyan-200"
-                                          : "bg-white/[0.02] border-white/[0.06] text-white/80 hover:border-white/15"
-                                      )}
-                                    >
-                                      <div className="flex items-center gap-3 overflow-hidden">
-                                        <button
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            toggleNodeProgress(node.id, isDone);
-                                          }}
-                                          className="text-white/40 hover:text-white transition-colors cursor-pointer"
-                                        >
-                                          {isDone ? (
-                                            <CheckCircle className="h-5 w-5 text-cyan-400 fill-cyan-400/10" />
-                                          ) : (
-                                            <Circle className="h-5 w-5" />
+                                    <div key={t.node.id} className="flex flex-col gap-2 relative">
+                                      {/* Topic Card */}
+                                      <motion.div
+                                        whileHover={{ y: -1 }}
+                                        onClick={() => setActiveNode(t.node)}
+                                        className={cn(
+                                          "p-4 rounded-xl border flex flex-col gap-3 justify-between bg-black/40 cursor-pointer transition-all duration-300 relative",
+                                          isTopicDone
+                                            ? "border-emerald-500/20 shadow-[0_4px_12px_rgba(16,185,129,0.05)]"
+                                            : "border-white/[0.06] hover:border-white/15"
+                                        )}
+                                      >
+                                        <div
+                                          className="absolute left-0 top-3 bottom-3 w-1 rounded-r-md"
+                                          style={{ backgroundColor: isTopicDone ? "#10b981" : topicColor }}
+                                        />
+                                        <div className="pl-2 space-y-1.5">
+                                          <div className="flex items-center gap-2 justify-between">
+                                            <span className="text-[9px] text-white/40 uppercase tracking-wider font-semibold">
+                                              {t.node.node_type || "topic"}
+                                            </span>
+                                            <div className="flex items-center gap-2">
+                                              {hasSubtopics && (
+                                                <Button
+                                                  variant="ghost"
+                                                  size="sm"
+                                                  onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    toggleTopicCollapse(t.node.id);
+                                                  }}
+                                                  className="h-5 px-1.5 text-[8px] text-white/40 hover:text-white hover:bg-white/5 rounded flex items-center gap-1"
+                                                >
+                                                  <ChevronRight className={cn("h-3 w-3 transition-transform duration-200", !isTopicCollapsed && "rotate-90")} />
+                                                  <span>{t.subtopics.length} Subtopics</span>
+                                                </Button>
+                                              )}
+                                              {isTopicDone && (
+                                                <span className="text-[8px] text-emerald-400 font-bold px-1 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/20">
+                                                  Done
+                                                </span>
+                                              )}
+                                            </div>
+                                          </div>
+                                          <h3 className="font-bold text-xs text-white/95 line-clamp-1">{t.node.title}</h3>
+                                          {t.node.description && (
+                                            <p className="text-[9px] text-white/40 line-clamp-2 leading-relaxed font-normal">
+                                              {t.node.description}
+                                            </p>
                                           )}
-                                        </button>
-                                        <span className="font-medium text-sm truncate">{node.title}</span>
-                                      </div>
-                                      <ChevronRight className="h-4 w-4 opacity-40 shrink-0" />
-                                    </motion.div>
+                                        </div>
+
+                                        <div className="pl-2 flex items-center justify-between pt-2 border-t border-white/[0.05]">
+                                          <button
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              toggleNodeProgress(t.node.id, isTopicDone);
+                                            }}
+                                            className="flex items-center gap-1.5 text-[10px] text-white/50 hover:text-white transition-colors cursor-pointer"
+                                          >
+                                            {isTopicDone ? (
+                                              <>
+                                                <CheckCircle className="h-3.5 w-3.5 text-emerald-400 fill-emerald-400/10" />
+                                                <span className="text-emerald-400 font-semibold">Done</span>
+                                              </>
+                                            ) : (
+                                              <>
+                                                <Circle className="h-3.5 w-3.5" />
+                                                <span>Mark Complete</span>
+                                              </>
+                                            )}
+                                          </button>
+                                          
+                                          {/* Show on Graph action */}
+                                          {roadmap.schema_version === "v2" && (
+                                            <Button
+                                              variant="ghost"
+                                              size="sm"
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                focusOnNode(t.node);
+                                              }}
+                                              className="h-6 px-2 text-[9px] text-cyan-400 hover:text-cyan-300 hover:bg-cyan-500/10 rounded-md cursor-pointer flex items-center gap-1"
+                                            >
+                                              <Map className="h-2.5 w-2.5" />
+                                              Show Graph
+                                            </Button>
+                                          )}
+                                        </div>
+                                      </motion.div>
+
+                                      {/* Subtopics Nested Tree List (Issue 2) */}
+                                      {hasSubtopics && !isTopicCollapsed && (
+                                        <div className="ml-6 pl-6 border-l border-white/10 mt-1 space-y-2 relative">
+                                          {t.subtopics.map((sub: any) => {
+                                            const isSubDone = completedNodes.includes(sub.node.id);
+                                            const subColor = sub.node.color || "#06b6d4";
+
+                                            return (
+                                              <div key={sub.node.id} className="relative">
+                                                {/* Connecting tree branches CSS lines */}
+                                                <div className="absolute left-0 top-1/2 w-4 h-px bg-white/10 -translate-x-6" />
+
+                                                <motion.div
+                                                  whileHover={{ y: -1 }}
+                                                  onClick={() => setActiveNode(sub.node)}
+                                                  className={cn(
+                                                    "p-3 rounded-lg border flex flex-col gap-2 justify-between bg-black/50 cursor-pointer transition-all duration-300 relative",
+                                                    isSubDone
+                                                      ? "border-emerald-500/20 shadow-[0_4px_12px_rgba(16,185,129,0.03)]"
+                                                      : "border-white/[0.04] hover:border-white/10"
+                                                  )}
+                                                >
+                                                  <div
+                                                    className="absolute left-0 top-2 bottom-2 w-0.5 rounded-r"
+                                                    style={{ backgroundColor: isSubDone ? "#10b981" : subColor }}
+                                                  />
+                                                  <div className="pl-2 space-y-1">
+                                                    <div className="flex items-center gap-2 justify-between">
+                                                      <span className="text-[8px] text-white/30 uppercase tracking-wider font-semibold">
+                                                        {sub.node.node_type || "subtopic"}
+                                                      </span>
+                                                      {isSubDone && (
+                                                        <span className="text-[7px] text-emerald-400 font-bold px-1 rounded bg-emerald-500/5 border border-emerald-500/10">
+                                                          Done
+                                                        </span>
+                                                      )}
+                                                    </div>
+                                                    <h4 className="font-bold text-[11px] text-white/90 line-clamp-1">{sub.node.title}</h4>
+                                                    {sub.node.description && (
+                                                      <p className="text-[8px] text-white/30 line-clamp-2 leading-relaxed font-normal">
+                                                        {sub.node.description}
+                                                      </p>
+                                                    )}
+                                                  </div>
+
+                                                  <div className="pl-2 flex items-center justify-between pt-1.5 border-t border-white/[0.03]">
+                                                    <button
+                                                      onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        toggleNodeProgress(sub.node.id, isSubDone);
+                                                      }}
+                                                      className="flex items-center gap-1 text-[9px] text-white/40 hover:text-white transition-colors cursor-pointer"
+                                                    >
+                                                      {isSubDone ? (
+                                                        <>
+                                                          <CheckCircle className="h-3 w-3 text-emerald-400 fill-emerald-400/10" />
+                                                          <span className="text-emerald-400 font-semibold">Done</span>
+                                                        </>
+                                                      ) : (
+                                                        <>
+                                                          <Circle className="h-3 w-3" />
+                                                          <span>Mark Complete</span>
+                                                        </>
+                                                      )}
+                                                    </button>
+                                                    
+                                                    {/* Show on Graph action */}
+                                                    {roadmap.schema_version === "v2" && (
+                                                      <Button
+                                                        variant="ghost"
+                                                        size="sm"
+                                                        onClick={(e) => {
+                                                          e.stopPropagation();
+                                                          focusOnNode(sub.node);
+                                                        }}
+                                                        className="h-5 px-1.5 text-[8px] text-cyan-400 hover:text-cyan-300 hover:bg-cyan-500/10 rounded cursor-pointer flex items-center gap-1"
+                                                      >
+                                                        <Map className="h-2 w-2" />
+                                                        Show Graph
+                                                      </Button>
+                                                    )}
+                                                  </div>
+                                                </motion.div>
+                                              </div>
+                                            );
+                                          })}
+                                        </div>
+                                      )}
+                                    </div>
                                   );
                                 })}
                               </div>
                             )}
                           </div>
-                        </div>
-                      </div>
-                    );
-                  })}
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
+              ) : (
+                /* Roadmap Flow View Mode */
+                roadmap.schema_version === "v2" ? (
+                  <div className="h-[60vh] border border-white/10 rounded-2xl bg-[#050505] overflow-hidden relative mb-12 shadow-[0_8px_32px_rgba(0,0,0,0.5)]">
+                    <ReactFlow
+                      nodes={flowchartNodes}
+                      edges={flowchartEdges}
+                      nodeTypes={customNodeTypes}
+                      onNodeClick={handleStudentNodeClick}
+                      fitView
+                      minZoom={0.2}
+                      maxZoom={1.5}
+                      nodesConnectable={false}
+                      nodesDraggable={false}
+                      zoomOnDoubleClick={false}
+                    >
+                      <Background color="#333" gap={15} size={1} />
+                      <Controls className="!bg-black/80 !border-white/10 !rounded-lg overflow-hidden [&_button]:!bg-transparent [&_button]:!border-white/5 [&_svg]:!fill-white/70" />
+                    </ReactFlow>
+                  </div>
+                ) : sections.length === 0 ? (
+                  <div className="border border-dashed border-white/10 rounded-2xl p-12 text-center text-white/40 text-sm">
+                    This roadmap does not have any sections yet.
+                  </div>
+                ) : (
+                  <div className="space-y-12">
+                    {sections.map((section, sIndex) => {
+                      const sectionNodes = nodes.filter((n) => n.section_id === section.id);
+
+                      return (
+                        <div key={section.id} className="relative">
+                          {/* Section Node connector line */}
+                          {sIndex < sections.length - 1 && (
+                            <div className="absolute left-6 top-16 bottom-0 w-0.5 bg-gradient-to-b from-white/10 to-transparent pointer-events-none" />
+                          )}
+
+                          <div className="flex gap-4">
+                            {/* Number badge */}
+                            <div className="h-12 w-12 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-white font-bold shrink-0 z-10">
+                              {sIndex + 1}
+                            </div>
+
+                            <div className="flex-1">
+                              <div className="mb-6 pt-2">
+                                <h2 className="text-xl font-bold text-white mb-1" style={{ fontFamily: "var(--font-display)" }}>
+                                  {section.title}
+                                </h2>
+                                {section.description && (
+                                  <p className="text-white/40 text-sm">{section.description}</p>
+                                )}
+                              </div>
+
+                              {/* Section topics list */}
+                              {sectionNodes.length === 0 ? (
+                                <p className="text-white/30 text-xs italic">No topics inside this section yet.</p>
+                              ) : (
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                  {sectionNodes.map((node) => {
+                                    const isDone = completedNodes.includes(node.id);
+
+                                    return (
+                                      <motion.div
+                                        key={node.id}
+                                        whileHover={{ scale: 1.01 }}
+                                        onClick={() => setActiveNode(node)}
+                                        className={cn(
+                                          "p-4 rounded-xl border flex items-center justify-between gap-3 cursor-pointer transition-all duration-300",
+                                          isDone
+                                            ? "bg-cyan-950/20 border-cyan-500/30 text-cyan-200"
+                                            : "bg-white/[0.02] border-white/[0.06] text-white/80 hover:border-white/15"
+                                        )}
+                                      >
+                                        <div className="flex items-center gap-3 overflow-hidden">
+                                          <button
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              toggleNodeProgress(node.id, isDone);
+                                            }}
+                                            className="text-white/40 hover:text-white transition-colors cursor-pointer"
+                                          >
+                                            {isDone ? (
+                                              <CheckCircle className="h-5 w-5 text-cyan-400 fill-cyan-400/10" />
+                                            ) : (
+                                              <Circle className="h-5 w-5" />
+                                            )}
+                                          </button>
+                                          <span className="font-medium text-sm truncate">{node.title}</span>
+                                        </div>
+                                        <ChevronRight className="h-4 w-4 opacity-40 shrink-0" />
+                                      </motion.div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )
               )}
             </div>
           )}
