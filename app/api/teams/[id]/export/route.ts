@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server';
+import { NextResponse, waitUntil } from 'next/server';
 import { verifySession, verifyTeamPermission, verifyTeamState, checkCooldown } from '@/lib/team-security';
 
 /**
@@ -39,19 +39,25 @@ export async function POST(
 
     if (error) throw error;
 
-    // 3.5 Trigger cron queue processing immediately and non-blockingly
+    // 3.5 Trigger cron queue processing worker route immediately using fetch within waitUntil to guarantee execution
     const baseUrl = new URL(request.url).origin;
     const cronSecret = process.env.CRON_SECRET || 'local-cron-fallback-key';
     
-    fetch(`${baseUrl}/api/cron`, {
+    const triggerPromise = fetch(`${baseUrl}/api/cron`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${cronSecret}`,
         'Content-Type': 'application/json'
       }
-    }).catch((err) => {
-      console.error('[EXPORT] Failed to trigger background cron processor:', err);
+    }).then(async (res) => {
+      if (!res.ok) {
+        throw new Error(`Worker route returned status ${res.status}: ${await res.text()}`);
+      }
     });
+
+    waitUntil(triggerPromise.catch((err) => {
+      console.error('[EXPORT] Failed to trigger background cron processor:', err);
+    }));
 
     // 4. Log audit log
     await supabase
