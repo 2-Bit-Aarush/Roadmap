@@ -28,8 +28,11 @@ import {
   Mail,
   ShieldAlert,
   Compass,
+  Users,
+  Sparkles,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { CreateTeamModal } from "@/components/create-team-modal";
 
 function DashboardContent() {
   const router = useRouter();
@@ -40,11 +43,14 @@ function DashboardContent() {
   const [activeTab, setActiveTab] = useState(initialTab);
   const [user, setUser] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
 
   // States for dashboard stats
   const [bookmarkedRoadmaps, setBookmarkedRoadmaps] = useState<any[]>([]);
   const [recentRoadmaps, setRecentRoadmaps] = useState<any[]>([]);
   const [progressDetails, setProgressDetails] = useState<any[]>([]);
+  const [dashboardTeams, setDashboardTeams] = useState<any[]>([]);
   const [overallStats, setOverallStats] = useState({
     totalCompleted: 0,
     startedRoadmaps: 0,
@@ -68,6 +74,22 @@ function DashboardContent() {
         }
         setUser(session.user);
         const userId = session.user.id;
+
+        // Fetch user profile role and check if website_admin
+        const { data: profile } = await supabase
+          .from("profiles")
+          .select("role")
+          .eq("id", userId)
+          .single();
+
+        const { data: adminRole } = await supabase
+          .from("admin_roles")
+          .select("role")
+          .eq("id", userId)
+          .single();
+
+        const isWebAdmin = (profile && profile.role === "website_admin") || (adminRole && adminRole.role === "admin");
+        setIsAdmin(!!isWebAdmin);
 
         // 1. Fetch bookmarks
         const { data: bookmarks } = await supabase
@@ -265,6 +287,13 @@ function DashboardContent() {
           startedRoadmaps: progressArray.length,
         });
 
+        // Fetch teams
+        const teamRes = await fetch('/api/teams');
+        const teamData = await teamRes.json();
+        if (teamData.success) {
+          setDashboardTeams(teamData.teams || []);
+        }
+
       } catch (err) {
         console.error("Error loading dashboard data:", err);
         toast.error("Error loading profile data");
@@ -413,6 +442,13 @@ function DashboardContent() {
                     Recently Viewed
                   </TabsTrigger>
                   <TabsTrigger
+                    value="teams"
+                    className="data-[state=active]:bg-white/10 data-[state=active]:text-white rounded-lg px-4 py-2 text-sm cursor-pointer"
+                  >
+                    <Users className="h-4 w-4 mr-2" />
+                    My Teams ({dashboardTeams.length})
+                  </TabsTrigger>
+                  <TabsTrigger
                     value="profile"
                     className="data-[state=active]:bg-white/10 data-[state=active]:text-white rounded-lg px-4 py-2 text-sm cursor-pointer"
                   >
@@ -548,18 +584,94 @@ function DashboardContent() {
                   )}
                 </TabsContent>
 
+                {/* Teams Tab Content */}
+                <TabsContent value="teams">
+                  <div className="flex justify-between items-center mb-6">
+                    <h2 className="text-xl font-bold text-white">My Collaborative Teams</h2>
+                    {!loading && isAdmin && (
+                      <Button
+                        onClick={() => setIsCreateOpen(true)}
+                        className="bg-purple-600 hover:bg-purple-700 text-white border-0 cursor-pointer h-9 px-4 text-xs gap-1.5"
+                      >
+                        <Sparkles className="h-3.5 w-3.5" />
+                        Create Team
+                      </Button>
+                    )}
+                  </div>
+
+                  {dashboardTeams.length === 0 ? (
+                    <div className="border border-white/[0.06] bg-white/[0.01] rounded-2xl p-16 text-center text-white/40 text-sm max-w-md mx-auto">
+                      <Users className="h-10 w-10 text-purple-400/50 mx-auto mb-4" />
+                      <p className="font-bold text-white mb-1">No active teams</p>
+                      <p className="text-white/40 mb-6">You are not a member of any team yet.</p>
+                      <div className="flex justify-center gap-2">
+                        <Button onClick={() => router.push("/")} className="bg-white/10 hover:bg-white/15 text-white border-0 cursor-pointer">
+                          Find Teams
+                        </Button>
+                        {!loading && isAdmin && (
+                          <Button onClick={() => setIsCreateOpen(true)} className="bg-purple-600 hover:bg-purple-700 text-white border-0 cursor-pointer">
+                            Create Team
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-6">
+                      {dashboardTeams.map((team) => (
+                        <div
+                          key={team.id}
+                          className="p-6 rounded-2xl border border-white/[0.06] bg-black/40 backdrop-blur-sm hover:border-purple-500/20 transition-all flex flex-col justify-between"
+                        >
+                          <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-4">
+                            <div>
+                              <span className="text-[10px] text-purple-400 font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-purple-500/10 border border-purple-500/20">
+                                {team.role} {team.is_pinned && "• Pinned"}
+                              </span>
+                              <h3 className="text-lg font-bold text-white mt-2">{team.name}</h3>
+                            </div>
+                            <Button
+                              size="sm"
+                              onClick={() => router.push(`/teams/${team.id}`)}
+                              className="bg-white/10 hover:bg-white/15 border border-white/20 text-white gap-1 cursor-pointer shrink-0"
+                            >
+                              Open Team
+                              <ArrowRight className="h-4 w-4" />
+                            </Button>
+                          </div>
+
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs text-white/60 mb-4 pt-4 border-t border-white/[0.04]">
+                            <div>
+                              <span className="text-white/30 block text-[10px] uppercase font-bold">Goal / Weekly Objective</span>
+                              <span className="text-white font-medium mt-1 block">{team.goal || "No objective set"}</span>
+                            </div>
+                            <div>
+                              <span className="text-white/30 block text-[10px] uppercase font-bold">Progress Snapshot</span>
+                              <span className="text-white font-medium mt-1 block">Completion: {team.metrics?.completion_rate || 0}%</span>
+                            </div>
+                            <div>
+                              <span className="text-white/30 block text-[10px] uppercase font-bold">Active Members</span>
+                              <span className="text-white font-medium mt-1 block">{team.metrics?.active_members || 1} active</span>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </TabsContent>
+
                 {/* Profile Tab Content */}
                 <TabsContent value="profile">
                   {user && (
                     <div className="max-w-xl mx-auto rounded-2xl border border-white/[0.08] bg-black/60 backdrop-blur-xl p-8 shadow-[0_8px_32px_rgba(0,0,0,0.4)] space-y-6">
                       <div className="flex items-center gap-6 pb-6 border-b border-white/[0.08]">
                         <div className="h-16 w-16 rounded-full bg-gradient-to-br from-blue-600 to-cyan-500 text-white font-bold text-2xl flex items-center justify-center shrink-0 shadow-[0_0_20px_rgba(59,130,246,0.3)]">
-                          {user.user_metadata?.full_name?.[0]?.toUpperCase() ||
+                          {user.user_metadata?.name?.[0]?.toUpperCase() ||
+                            user.user_metadata?.full_name?.[0]?.toUpperCase() ||
                             user.email?.[0]?.toUpperCase() ||
                             "U"}
                         </div>
                         <div>
-                          <h3 className="text-xl font-bold text-white">{user.user_metadata?.full_name || "Student"}</h3>
+                          <h3 className="text-xl font-bold text-white">{user.user_metadata?.name || user.user_metadata?.full_name || "Student"}</h3>
                           <span className="text-white/40 text-sm flex items-center gap-1.5 mt-1">
                             <Mail className="h-4 w-4 text-cyan-400" />
                             {user.email}
@@ -594,7 +706,7 @@ function DashboardContent() {
                   <h1 className="text-3xl font-extrabold tracking-tight">Roadmap Platform Progress Report</h1>
                   {user && (
                     <div className="mt-2 text-sm text-gray-600">
-                      <span>Student: {user.user_metadata?.full_name || "Student"} ({user.email})</span>
+                      <span>Student: {user.user_metadata?.name || user.user_metadata?.full_name || "Student"} ({user.email})</span>
                       <span className="mx-3">|</span>
                       <span>Date: {new Date().toLocaleDateString()}</span>
                     </div>
@@ -673,6 +785,21 @@ function DashboardContent() {
         </section>
       </div>
 
+      <CreateTeamModal
+        isOpen={isCreateOpen}
+        onClose={() => setIsCreateOpen(false)}
+        onSuccess={(newTeam) => {
+          const formattedTeam = {
+            ...newTeam,
+            role: 'team_admin',
+            is_pinned: false,
+            is_favorite: false,
+            joined_at: new Date().toISOString(),
+            metrics: { completion_rate: 0, active_members: 1, weekly_activity: 0 },
+          };
+          setDashboardTeams(prev => [formattedTeam, ...prev]);
+        }}
+      />
       <Footer className="print:hidden" />
     </main>
   );

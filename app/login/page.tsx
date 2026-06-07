@@ -59,7 +59,7 @@ function LoginContent() {
           password,
           options: {
             data: {
-              full_name: fullName,
+              name: fullName,
             },
             emailRedirectTo: `${window.location.origin}/auth/callback?redirectedFrom=${redirectedFrom}`,
           },

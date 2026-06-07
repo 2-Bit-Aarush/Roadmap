@@ -48,6 +48,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Switch } from "@/components/ui/switch";
 
 // Zod schemas for admin input validation
+
 const roadmapSchema = z.object({
   title: z.string().min(3, "Title must be at least 3 characters").max(100, "Title must not exceed 100 characters"),
   description: z.string().max(1000, "Description must not exceed 1000 characters").optional(),
@@ -97,7 +98,7 @@ function AdminContent() {
   const [roadmaps, setRoadmaps] = useState<any[]>([]);
   const [isRoadmapModalOpen, setIsRoadmapModalOpen] = useState(false);
   const [editingRoadmap, setEditingRoadmap] = useState<any>(null);
-  
+
   // Roadmap form states
   const [rmTitle, setRmTitle] = useState("");
   const [rmDescription, setRmDescription] = useState("");
@@ -126,6 +127,11 @@ function AdminContent() {
   const [usersList, setUsersList] = useState<any[]>([]);
   const [logsList, setLogsList] = useState<any[]>([]);
 
+  // Teams management states
+  const [teamsList, setTeamsList] = useState<any[]>([]);
+  const [isManageAdminsModalOpen, setIsManageAdminsModalOpen] = useState(false);
+  const [selectedTeamForAdmins, setSelectedTeamForAdmins] = useState<any>(null);
+
   // Import state machine & lifecycle (Section 4)
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [importState, setImportState] = useState<'idle' | 'validating' | 'normalizing' | 'building' | 'saving_nodes' | 'saving_edges' | 'finalizing' | 'success' | 'failed' | 'cancelled'>('idle');
@@ -135,13 +141,13 @@ function AdminContent() {
   const [collisionAction, setCollisionAction] = useState<'overwrite' | 'merge' | 'duplicate'>('duplicate');
   const [importFilename, setImportFilename] = useState("");
   const [importTargetRmId, setImportTargetRmId] = useState<string | null>(null);
-  
+
   // Dry run / preview states (Section 8)
   const [validationOutput, setValidationOutput] = useState<any>(null);
   const [normalizedRoadmapData, setNormalizedRoadmapData] = useState<any>(null);
   const [previewNodes, setPreviewNodes] = useState<any[]>([]);
   const [previewEdges, setPreviewEdges] = useState<any[]>([]);
-  
+
   // Error / Recovery states (Section 3 & 6)
   const [errorReason, setErrorReason] = useState("");
   const [recoveredFromDraft, setRecoveredFromDraft] = useState(false);
@@ -194,14 +200,14 @@ function AdminContent() {
   // Smooth progress increment loop (Section 1)
   const startSmoothProgress = (targetMin: number, targetMax: number, durationMs: number) => {
     if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
-    
-    const stepTime = 50; 
+
+    const stepTime = 50;
     const steps = durationMs / stepTime;
     const increment = (targetMax - targetMin) / steps;
     let currentVal = targetMin;
-    
+
     setImportProgress(Math.round(currentVal));
-    
+
     progressIntervalRef.current = setInterval(() => {
       currentVal = Math.min(currentVal + increment, targetMax);
       setImportProgress(Math.round(currentVal));
@@ -320,7 +326,7 @@ function AdminContent() {
   // Transaction execution pipeline (Section 5)
   const handleExecuteImport = async () => {
     if (!normalizedRoadmapData) return;
-    
+
     const nodeCount = normalizedRoadmapData.nodes.length;
     const edgeCount = normalizedRoadmapData.edges.length;
 
@@ -358,7 +364,7 @@ function AdminContent() {
     if (cancellationRef.current) return;
 
     const targetRm = collisionAction === 'duplicate' ? null : importTargetRmId;
-    
+
     // Concurrency Lock checks
     if (targetRm) {
       try {
@@ -367,15 +373,15 @@ function AdminContent() {
           .select('locked_by, locked_at, import_state, updated_at')
           .eq('id', targetRm)
           .single();
-          
+
         if (fetchRmError) throw fetchRmError;
-        
+
         if (rm) {
           if (rm.import_state === 'importing') {
             const now = new Date();
             const importLockExpiry = 10 * 60 * 1000; // 10 mins stuck timeout
             const isLockActive = now.getTime() - new Date(rm.locked_at || rm.updated_at).getTime() < importLockExpiry;
-            
+
             if (isLockActive) {
               setImportState('failed');
               setErrorReason('An import is already actively running on this roadmap. Please wait or retry after 10 minutes.');
@@ -389,12 +395,12 @@ function AdminContent() {
               }
             }
           }
-          
+
           if (rm.locked_by && rm.locked_by !== adminUser.id) {
             const now = new Date();
-            const lockExpiry = 5 * 60 * 1000; 
+            const lockExpiry = 5 * 60 * 1000;
             const isLockActive = now.getTime() - new Date(rm.locked_at).getTime() < lockExpiry;
-            
+
             if (isLockActive) {
               setImportState('failed');
               setErrorReason('This roadmap is locked by another admin editing it.');
@@ -502,14 +508,14 @@ function AdminContent() {
       toast.success("Roadmap imported successfully!");
       clearDraftFromSession();
       setRecoveredFromDraft(false);
-      
+
       const { data: logs } = await supabase
         .from("admin_logs")
         .select("*, profiles(name, email)")
         .order("created_at", { ascending: false })
         .limit(100);
       setLogsList(logs || []);
-      
+
       await loadRoadmaps();
 
     } catch (err: any) {
@@ -559,7 +565,7 @@ function AdminContent() {
         const { data: profiles } = await supabase
           .from("profiles")
           .select("*");
-        
+
         // Count progress per user to calculate analytics
         const { data: progress } = await supabase
           .from("progress_tracking")
@@ -582,6 +588,9 @@ function AdminContent() {
           .limit(100);
         setLogsList(logs || []);
 
+        // Fetch Teams list
+        await loadTeams();
+
       } catch (err) {
         console.error("Admin initialization error:", err);
       } finally {
@@ -591,6 +600,159 @@ function AdminContent() {
 
     verifyAdminAndLoad();
   }, [router]);
+
+  const loadTeams = async () => {
+    try {
+      const res = await fetch("/api/admin/teams");
+      const data = await res.json();
+      if (data.success) {
+        setTeamsList(data.teams || []);
+      } else {
+        toast.error(data.error || "Failed to load teams");
+      }
+    } catch (err) {
+      console.error("Error loading teams:", err);
+      toast.error("An error occurred while loading teams");
+    }
+  };
+
+  const handleBanToggle = async (teamId: string, currentStatus: string) => {
+    const targetStatus = currentStatus === "banned" ? "active" : "banned";
+    try {
+      const res = await fetch(`/api/admin/teams/${teamId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: targetStatus }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        toast.success(`Team successfully ${targetStatus === "banned" ? "banned" : "unbanned"}`);
+        await loadTeams();
+      } else {
+        toast.error(data.error || "Failed to toggle ban status");
+      }
+    } catch (err) {
+      console.error("Error toggling ban:", err);
+      toast.error("An error occurred");
+    }
+  };
+
+  const handleArchiveToggle = async (teamId: string, currentStatus: string) => {
+    const targetStatus = currentStatus === "archived" ? "active" : "archived";
+    try {
+      const res = await fetch(`/api/admin/teams/${teamId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: targetStatus }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        toast.success(`Team successfully ${targetStatus === "archived" ? "archived" : "unarchived"}`);
+        await loadTeams();
+      } else {
+        toast.error(data.error || "Failed to toggle archive status");
+      }
+    } catch (err) {
+      console.error("Error toggling archive:", err);
+      toast.error("An error occurred");
+    }
+  };
+
+  const handleToggleInvites = async (teamId: string, currentSuspendState: boolean) => {
+    const targetSuspend = !currentSuspendState;
+    try {
+      const res = await fetch(`/api/admin/teams/${teamId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ suspendInvites: targetSuspend }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        toast.success(`Invites successfully ${targetSuspend ? "disabled" : "enabled"}`);
+        await loadTeams();
+      } else {
+        toast.error(data.error || "Failed to toggle invites");
+      }
+    } catch (err) {
+      console.error("Error toggling invites:", err);
+      toast.error("An error occurred");
+    }
+  };
+
+  const handleDisbandTeam = async (teamId: string) => {
+    if (!confirm("Are you absolutely sure you want to disband (soft-delete) this team? Audit logs will be preserved.")) {
+      return;
+    }
+    try {
+      const res = await fetch(`/api/admin/teams/${teamId}`, {
+        method: "DELETE",
+      });
+      const data = await res.json();
+      if (data.success) {
+        toast.success("Team disbanded successfully");
+        await loadTeams();
+      } else {
+        toast.error(data.error || "Failed to disband team");
+      }
+    } catch (err) {
+      console.error("Error disbanding team:", err);
+      toast.error("An error occurred");
+    }
+  };
+
+  const handlePromoteAdmin = async (teamId: string, userId: string) => {
+    try {
+      const res = await fetch(`/api/admin/teams/${teamId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ promoteAdminUserId: userId }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        toast.success("Member promoted to team admin successfully");
+        await loadTeams();
+        setSelectedTeamForAdmins((prev: any) => {
+          if (!prev) return null;
+          const updatedMemberships = prev.memberships.map((m: any) =>
+            m.user_id === userId ? { ...m, role: "team_admin" } : m
+          );
+          return { ...prev, memberships: updatedMemberships };
+        });
+      } else {
+        toast.error(data.error || "Failed to promote member");
+      }
+    } catch (err) {
+      console.error("Error promoting member:", err);
+      toast.error("An error occurred");
+    }
+  };
+
+  const handleDemoteAdmin = async (teamId: string, userId: string) => {
+    try {
+      const res = await fetch(`/api/admin/teams/${teamId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ demoteAdminUserId: userId }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        toast.success("Team admin demoted successfully");
+        await loadTeams();
+        setSelectedTeamForAdmins((prev: any) => {
+          if (!prev) return null;
+          const updatedMemberships = prev.memberships.map((m: any) =>
+            m.user_id === userId ? { ...m, role: "member" } : m
+          );
+          return { ...prev, memberships: updatedMemberships };
+        });
+      } else {
+        toast.error(data.error || "Failed to demote team admin");
+      }
+    } catch (err) {
+      console.error("Error demoting admin:", err);
+      toast.error("An error occurred");
+    }
+  };
 
   const loadRoadmaps = async () => {
     const { data } = await supabase
@@ -789,7 +951,7 @@ function AdminContent() {
         .from("roadmap_sections")
         .update({ order_index: item2.order_index })
         .eq("id", item1.id);
-      
+
       const { error: err2 } = await supabase
         .from("roadmap_sections")
         .update({ order_index: item1.order_index })
@@ -930,7 +1092,7 @@ function AdminContent() {
         .from("roadmap_nodes")
         .update({ order_index: item2.order_index })
         .eq("id", item1.id);
-      
+
       const { error: err2 } = await supabase
         .from("roadmap_nodes")
         .update({ order_index: item1.order_index })
@@ -1366,6 +1528,13 @@ function AdminContent() {
                     <History className="h-4 w-4 mr-2" />
                     Audit Logs
                   </TabsTrigger>
+                  <TabsTrigger
+                    value="teams"
+                    className="data-[state=active]:bg-white/10 data-[state=active]:text-white rounded-lg px-4 py-2 text-sm cursor-pointer"
+                  >
+                    <Shield className="h-4 w-4 mr-2" />
+                    Team Management
+                  </TabsTrigger>
                 </TabsList>
 
                 {/* Manage Roadmaps Tab */}
@@ -1572,6 +1741,179 @@ function AdminContent() {
                     </Table>
                   </div>
                 </TabsContent>
+
+                {/* Team Management Tab */}
+                <TabsContent value="teams">
+                  <div className="flex justify-between items-center mb-6">
+                    <h3 className="text-lg font-bold text-white font-display">Collaborative Teams Directory</h3>
+                  </div>
+
+                  <div className="rounded-xl border border-white/[0.08] bg-black/40 backdrop-blur-sm overflow-hidden">
+                    <Table>
+                      <TableHeader className="bg-white/5 border-b border-white/10">
+                        <TableRow className="hover:bg-transparent">
+                          <TableHead className="text-white/60">Team Name</TableHead>
+                          <TableHead className="text-white/60">Owner / Admins</TableHead>
+                          <TableHead className="text-white/60 text-center">Members</TableHead>
+                          <TableHead className="text-white/60 text-center">Invites</TableHead>
+                          <TableHead className="text-white/60">Status</TableHead>
+                          <TableHead className="text-white/60">Created At</TableHead>
+                          <TableHead className="text-white/60 text-right">Actions</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {teamsList.length === 0 ? (
+                          <TableRow>
+                            <TableCell colSpan={7} className="text-center text-white/40 py-10">
+                              No teams found in the system.
+                            </TableCell>
+                          </TableRow>
+                        ) : (
+                          teamsList.map((team) => {
+                            const ownerName = team.owner?.name || team.owner?.email || "Unknown Owner";
+                            
+                            // Get admin list from memberships
+                            const adminMemberships = team.memberships?.filter(
+                              (m: any) => m.role === "team_admin" && m.is_active
+                            ) || [];
+                            
+                            const activeMembersCount = team.memberships?.filter(
+                              (m: any) => m.is_active
+                            ).length || 0;
+
+                            const isInvitesSuspended = team.settings?.admin?.suspend_invites === true;
+
+                            return (
+                              <TableRow key={team.id} className="border-b border-white/[0.05] hover:bg-white/[0.02]">
+                                <TableCell className="max-w-xs">
+                                  <div className="font-semibold text-white truncate">{team.name}</div>
+                                  <div className="text-xs text-white/40 truncate mt-0.5">{team.description || "No description"}</div>
+                                  <div className="text-[10px] text-white/30 mt-1 capitalize font-mono">{team.visibility}</div>
+                                </TableCell>
+                                <TableCell className="max-w-xs">
+                                  <div className="text-sm text-cyan-400 font-medium truncate">Owner: {ownerName}</div>
+                                  {adminMemberships.length > 0 && (
+                                    <div className="text-xs text-white/50 mt-1 truncate">
+                                      Admins: {adminMemberships.map((m: any) => m.display_name || m.profiles?.name || m.profiles?.email || "Unknown").join(", ")}
+                                    </div>
+                                  )}
+                                </TableCell>
+                                <TableCell className="text-center font-bold text-white/90">
+                                  {activeMembersCount} {team.member_limit ? `/ ${team.member_limit}` : ""}
+                                </TableCell>
+                                <TableCell className="text-center">
+                                  <span className={cn(
+                                    "px-2 py-0.5 rounded text-[10px] font-bold border",
+                                    isInvitesSuspended
+                                      ? "bg-red-500/10 border-red-500/20 text-red-400"
+                                      : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
+                                  )}>
+                                    {isInvitesSuspended ? "Suspended" : "Active"}
+                                  </span>
+                                </TableCell>
+                                <TableCell>
+                                  <span className={cn(
+                                    "px-2 py-0.5 rounded text-[10px] font-bold border capitalize",
+                                    team.status === "active" && "bg-emerald-500/10 border-emerald-500/20 text-emerald-400",
+                                    team.status === "banned" && "bg-red-500/10 border-red-500/20 text-red-400",
+                                    team.status === "archived" && "bg-amber-500/10 border-amber-500/20 text-amber-400",
+                                    team.status === "deleted" && "bg-white/10 border-white/20 text-white/40"
+                                  )}>
+                                    {team.status === "deleted" ? "Disbanded" : team.status}
+                                  </span>
+                                </TableCell>
+                                <TableCell className="text-white/40 text-xs">
+                                  {new Date(team.created_at).toLocaleDateString()}
+                                </TableCell>
+                                <TableCell className="text-right">
+                                  <div className="flex justify-end items-center gap-1.5 flex-wrap max-w-sm">
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      onClick={() => {
+                                        setSelectedTeamForAdmins(team);
+                                        setIsManageAdminsModalOpen(true);
+                                      }}
+                                      className="h-8 px-2 text-white/60 hover:text-white hover:bg-white/5 text-xs cursor-pointer"
+                                      disabled={team.status === "deleted"}
+                                    >
+                                      Manage Admins
+                                    </Button>
+
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      onClick={() => handleToggleInvites(team.id, isInvitesSuspended)}
+                                      className={cn(
+                                        "h-8 px-2 text-xs cursor-pointer",
+                                        isInvitesSuspended
+                                          ? "text-emerald-400 hover:bg-emerald-500/10 hover:text-emerald-300"
+                                          : "text-red-400 hover:bg-red-500/10 hover:text-red-300"
+                                      )}
+                                      disabled={team.status === "deleted" || team.status === "banned"}
+                                    >
+                                      {isInvitesSuspended ? "Enable Invites" : "Disable Invites"}
+                                    </Button>
+
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      onClick={() => handleBanToggle(team.id, team.status)}
+                                      className={cn(
+                                        "h-8 px-2 text-xs cursor-pointer",
+                                        team.status === "banned"
+                                          ? "text-emerald-400 hover:bg-emerald-500/10 hover:text-emerald-300"
+                                          : "text-red-400 hover:bg-red-500/10 hover:text-red-300"
+                                      )}
+                                      disabled={team.status === "deleted"}
+                                    >
+                                      {team.status === "banned" ? "Unban" : "Ban"}
+                                    </Button>
+
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      onClick={() => handleArchiveToggle(team.id, team.status)}
+                                      className={cn(
+                                        "h-8 px-2 text-xs cursor-pointer",
+                                        team.status === "archived"
+                                          ? "text-emerald-400 hover:bg-emerald-500/10 hover:text-emerald-300"
+                                          : "text-amber-400 hover:bg-amber-500/10 hover:text-amber-300"
+                                      )}
+                                      disabled={team.status === "deleted" || team.status === "banned"}
+                                    >
+                                      {team.status === "archived" ? "Unarchive" : "Archive"}
+                                    </Button>
+
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      onClick={() => router.push(`/teams/${team.id}`)}
+                                      className="h-8 px-2 text-cyan-400 hover:bg-cyan-500/10 hover:text-cyan-300 text-xs cursor-pointer"
+                                      disabled={team.status === "deleted"}
+                                    >
+                                      Manage
+                                    </Button>
+
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      onClick={() => handleDisbandTeam(team.id)}
+                                      className="h-8 px-2 text-red-500 hover:bg-red-500/10 hover:text-red-400 text-xs cursor-pointer"
+                                      disabled={team.status === "deleted"}
+                                    >
+                                      Disband
+                                    </Button>
+                                  </div>
+                                </TableCell>
+                              </TableRow>
+                            );
+                          })
+                        )}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </TabsContent>
               </Tabs>
 
               {/* Create/Edit Roadmap Dialog Modal */}
@@ -1690,6 +2032,81 @@ function AdminContent() {
                 </DialogContent>
               </Dialog>
 
+              {/* Manage Admins Dialog Modal */}
+              <Dialog open={isManageAdminsModalOpen} onOpenChange={() => setIsManageAdminsModalOpen(false)}>
+                <DialogContent className="bg-black/95 border border-white/10 text-white backdrop-blur-2xl max-w-lg shadow-[0_8px_32px_rgba(0,0,0,0.6)]">
+                  <DialogHeader>
+                    <DialogTitle className="text-lg font-bold text-white mb-2">
+                      Manage Team Administrators
+                    </DialogTitle>
+                    <p className="text-white/40 text-xs">
+                      Promote members to team admins or demote current ones.
+                    </p>
+                  </DialogHeader>
+
+                  <div className="space-y-4 max-h-[400px] overflow-y-auto pr-2 mt-4">
+                    {selectedTeamForAdmins?.memberships?.length === 0 ? (
+                      <div className="text-center text-white/40 py-6 text-sm">No members in this team.</div>
+                    ) : (
+                      selectedTeamForAdmins?.memberships?.map((m: any) => {
+                        const name = m.display_name || m.profiles?.name || m.profiles?.email || "Unknown User";
+                        const email = m.profiles?.email || "";
+                        const isOwner = selectedTeamForAdmins.owner_id === m.user_id;
+                        const isAdmin = m.role === "team_admin";
+
+                        return (
+                          <div key={m.user_id} className="flex justify-between items-center p-3 rounded-lg bg-white/5 border border-white/[0.05]">
+                            <div className="truncate pr-4">
+                              <div className="font-semibold text-sm text-white truncate flex items-center gap-1.5">
+                                {name}
+                                {isOwner && (
+                                  <span className="text-[10px] bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 px-1.5 py-0.5 rounded font-bold uppercase">
+                                    Owner
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-xs text-white/40 truncate">{email}</div>
+                            </div>
+
+                            <div>
+                              {isOwner ? (
+                                <span className="text-xs text-white/30 font-medium mr-2">Owner Role Required</span>
+                              ) : isAdmin ? (
+                                <Button
+                                  size="sm"
+                                  onClick={() => handleDemoteAdmin(selectedTeamForAdmins.id, m.user_id)}
+                                  className="bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 text-xs h-8 cursor-pointer"
+                                >
+                                  Demote
+                                </Button>
+                              ) : (
+                                <Button
+                                  size="sm"
+                                  onClick={() => handlePromoteAdmin(selectedTeamForAdmins.id, m.user_id)}
+                                  className="bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/20 text-xs h-8 cursor-pointer"
+                                >
+                                  Make Admin
+                                </Button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  <DialogFooter className="mt-6 border-t border-white/5 pt-4">
+                    <Button
+                      variant="ghost"
+                      onClick={() => setIsManageAdminsModalOpen(false)}
+                      className="text-white/60 hover:text-white hover:bg-white/5 cursor-pointer"
+                    >
+                      Close
+                    </Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
+
               {/* Import Roadmap JSON Dialog Modal */}
               <Dialog open={isImportModalOpen} onOpenChange={(open) => {
                 if (importState === 'idle' || importState === 'success' || importState === 'failed' || importState === 'cancelled') {
@@ -1702,7 +2119,7 @@ function AdminContent() {
                   }
                 }
               }}>
-                <DialogContent 
+                <DialogContent
                   className="bg-black/95 border border-white/10 text-white backdrop-blur-2xl max-w-3xl max-h-[85vh] overflow-y-auto shadow-[0_8px_32px_rgba(0,0,0,0.6)]"
                   onPointerDownOutside={(e) => {
                     if (importState !== 'idle' && importState !== 'success' && importState !== 'failed' && importState !== 'cancelled') {
@@ -1737,8 +2154,8 @@ function AdminContent() {
                       {recoveredFromDraft && importState === 'idle' && (
                         <div className="p-3 rounded-lg border border-cyan-500/20 bg-cyan-500/10 text-cyan-200 text-xs flex justify-between items-center">
                           <span>Recovered previous import draft.</span>
-                          <button 
-                            type="button" 
+                          <button
+                            type="button"
                             onClick={() => {
                               clearDraftFromSession();
                               setImportText("");
@@ -1804,8 +2221,8 @@ function AdminContent() {
 
                           <div className="space-y-1.5">
                             <Label className="text-white/70 text-xs">File Upload (Optional)</Label>
-                            <Input 
-                              type="file" 
+                            <Input
+                              type="file"
                               accept=".json"
                               onChange={(e) => {
                                 const file = e.target.files?.[0];
@@ -1826,7 +2243,7 @@ function AdminContent() {
 
                           <div className="space-y-1.5">
                             <Label className="text-white/70 text-xs">Paste Raw JSON Roadmap Configuration</Label>
-                            <Textarea 
+                            <Textarea
                               rows={8}
                               value={importText}
                               onChange={(e) => setImportText(e.target.value)}
@@ -1908,8 +2325,8 @@ function AdminContent() {
                                 <div className="pt-2">
                                   <span className="font-bold text-[10px] text-white/40 uppercase block mb-1">Flowchart Topology Preview</span>
                                   <div className="h-40 border border-white/5 bg-black/80 rounded-lg overflow-hidden relative">
-                                    <ReactFlow 
-                                      nodes={previewNodes} 
+                                    <ReactFlow
+                                      nodes={previewNodes}
                                       edges={previewEdges}
                                       fitView
                                       nodesDraggable={false}
@@ -1927,8 +2344,8 @@ function AdminContent() {
                           )}
 
                           <DialogFooter className="border-t border-white/10 pt-4 flex justify-end gap-2">
-                            <Button 
-                              variant="outline" 
+                            <Button
+                              variant="outline"
                               onClick={() => {
                                 setIsImportModalOpen(false);
                                 clearDraftFromSession();
@@ -1940,7 +2357,7 @@ function AdminContent() {
                             >
                               Cancel
                             </Button>
-                            <Button 
+                            <Button
                               onClick={handleExecuteImport}
                               disabled={!normalizedRoadmapData || (validationOutput?.errors?.length || 0) > 0}
                               className="bg-cyan-600 hover:bg-cyan-500 text-white border-0 cursor-pointer disabled:opacity-30 disabled:pointer-events-none"
@@ -1974,8 +2391,8 @@ function AdminContent() {
                           {/* Cancellation button */}
                           <div className="pt-4">
                             {['validating', 'normalizing', 'building'].includes(importState) ? (
-                              <Button 
-                                variant="outline" 
+                              <Button
+                                variant="outline"
                                 onClick={() => {
                                   cancellationRef.current = true;
                                   setImportState('cancelled');
@@ -2008,7 +2425,7 @@ function AdminContent() {
                             <div>Nodes: {normalizedRoadmapData?.nodes?.length || 0}</div>
                             <div>Edges: {normalizedRoadmapData?.edges?.length || 0}</div>
                           </div>
-                          <Button 
+                          <Button
                             onClick={() => {
                               setIsImportModalOpen(false);
                               setImportState('idle');
@@ -2028,7 +2445,7 @@ function AdminContent() {
                         <div className="flex flex-col items-center justify-center py-10 text-center space-y-5">
                           <div className="text-red-400 text-lg font-bold">Import Cancelled</div>
                           <p className="text-xs text-white/50 max-w-sm">The import pipeline was halted, and database write locks have been safely released.</p>
-                          <Button 
+                          <Button
                             onClick={() => setImportState('idle')}
                             className="bg-white/10 hover:bg-white/20 text-white border-0 text-xs px-4"
                           >
@@ -2048,8 +2465,8 @@ function AdminContent() {
                             {errorReason}
                           </div>
                           <div className="flex gap-2">
-                            <Button 
-                              variant="outline" 
+                            <Button
+                              variant="outline"
                               onClick={() => {
                                 setImportState('idle');
                                 setErrorReason("");
@@ -2058,7 +2475,7 @@ function AdminContent() {
                             >
                               Back
                             </Button>
-                            <Button 
+                            <Button
                               onClick={handleExecuteImport}
                               className="bg-cyan-600 hover:bg-cyan-500 text-white border-0 text-xs px-6"
                             >
@@ -2123,8 +2540,8 @@ function AdminContent() {
                         </Table>
                       </div>
                       <div className="pt-4 flex justify-end">
-                        <Button 
-                          variant="outline" 
+                        <Button
+                          variant="outline"
                           onClick={() => setIsImportModalOpen(false)}
                           className="border-white/10 hover:bg-white/5 text-white/80 text-xs"
                         >

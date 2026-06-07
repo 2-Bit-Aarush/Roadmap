@@ -46,8 +46,10 @@ export async function middleware(request: NextRequest) {
   const isCategory = path.startsWith('/category');
   const isAdmin = path.startsWith('/admin');
   const isLogin = path.startsWith('/login');
+  const isTeams = path.startsWith('/teams') || path.startsWith('/api/teams');
+  const isInvites = path.startsWith('/api/invites');
 
-  if (!user && (isDashboard || isRoadmap || isCategory || isAdmin)) {
+  if (!user && (isDashboard || isRoadmap || isCategory || isAdmin || isTeams || isInvites)) {
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = '/login';
     redirectUrl.searchParams.set('redirectedFrom', path);
@@ -126,6 +128,9 @@ export const config = {
     '/roadmap/:path*',
     '/category/:path*',
     '/admin/:path*',
+    '/teams/:path*',
+    '/api/teams/:path*',
+    '/api/invites/:path*',
     '/login',
   ],
 };

@@ -1470,10 +1470,10 @@ export default function EditRoadmapPage({ params }: EditRoadmapProps) {
                       }}
                       className="w-full bg-white/5 border border-white/10 text-white rounded-lg p-2 text-xs focus:outline-none focus:border-cyan-500 disabled:opacity-50 disabled:pointer-events-none"
                     >
-                      <option value="topic">Topic Node</option>
-                      <option value="group">Container / Group</option>
-                      <option value="subtopic">Sub-Topic Node</option>
-                      <option value="resource">Resource Hub</option>
+                      <option value="topic" className="bg-zinc-950 text-white">Topic Node</option>
+                      <option value="group" className="bg-zinc-950 text-white">Container / Group</option>
+                      <option value="subtopic" className="bg-zinc-950 text-white">Sub-Topic Node</option>
+                      <option value="resource" className="bg-zinc-950 text-white">Resource Hub</option>
                     </select>
                   </div>
 

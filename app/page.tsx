@@ -5,6 +5,7 @@ import { Navbar } from "@/components/navbar";
 import { Sidebar } from "@/components/sidebar";
 import { HeroSection } from "@/components/hero-section";
 import { RoadmapCards } from "@/components/roadmap-cards";
+import { YourTeams } from "@/components/your-teams";
 import { AboutSection } from "@/components/about-section";
 import { Footer } from "@/components/footer";
 
@@ -37,6 +38,9 @@ export default function Home() {
 
         {/* Roadmap Cards Section */}
         <RoadmapCards />
+
+        {/* Your Teams Section */}
+        <YourTeams />
 
         {/* About Section */}
         <AboutSection />

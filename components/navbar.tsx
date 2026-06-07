@@ -146,10 +146,11 @@ export function Navbar({ onMenuClick, isMenuOpen }: NavbarProps) {
                     <Avatar className="h-9 w-9">
                       <AvatarImage
                         src={user.user_metadata?.avatar_url || ""}
-                        alt={user.user_metadata?.full_name || user.email || "User"}
+                        alt={user.user_metadata?.name || user.user_metadata?.full_name || user.email || "User"}
                       />
                       <AvatarFallback className="bg-gradient-to-br from-blue-600 to-cyan-500 text-white text-xs font-bold">
-                        {user.user_metadata?.full_name?.[0]?.toUpperCase() ||
+                        {user.user_metadata?.name?.[0]?.toUpperCase() ||
+                          user.user_metadata?.full_name?.[0]?.toUpperCase() ||
                           user.email?.[0]?.toUpperCase() ||
                           "U"}
                       </AvatarFallback>
@@ -160,7 +161,7 @@ export function Navbar({ onMenuClick, isMenuOpen }: NavbarProps) {
                   <DropdownMenuLabel className="font-normal">
                     <div className="flex flex-col space-y-1">
                       <p className="text-sm font-semibold leading-none">
-                        {user.user_metadata?.full_name || "Student"}
+                        {user.user_metadata?.name || user.user_metadata?.full_name || "Student"}
                       </p>
                       <p className="text-xs leading-none text-white/50">
                         {user.email}
