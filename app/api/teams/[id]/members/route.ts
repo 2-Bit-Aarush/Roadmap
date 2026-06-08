@@ -95,7 +95,57 @@ export async function GET(
       const total = filtered.length;
       const paginated = filtered.slice(offset, offset + limit);
 
-      // 3. Derive dynamic presence states and map singular profile compatibility
+      // Fetch team settings and owner_id for privacy rules
+      const { data: teamData, error: teamError } = await supabase
+        .from('teams')
+        .select('settings, owner_id')
+        .eq('id', id)
+        .single();
+
+      if (teamError || !teamData) {
+        throw new Error(teamError?.message || 'Team settings not found');
+      }
+
+      const settings = teamData.settings as any;
+      let progressVisibility = settings?.progress_visibility;
+      
+      // Backward compatibility mapping for anonymization_enabled
+      if (settings?.privacy?.anonymization_enabled !== undefined) {
+        progressVisibility = settings.privacy.anonymization_enabled ? 'anonymous' : 'public_team';
+      } else if (settings?.anonymization_enabled !== undefined) {
+        progressVisibility = settings.anonymization_enabled ? 'anonymous' : 'public_team';
+      }
+      
+      if (!progressVisibility) {
+        progressVisibility = settings?.privacy?.progress_visibility || 'public_team';
+      }
+
+      const isRequesterElevated = 
+        ['website_admin', 'team_admin', 'mentor'].includes(membershipLookup.role) || 
+        membershipLookup.isOwner;
+
+      // Batch query progress tracking and total nodes count to avoid N+1 queries
+      const memberIds = paginated.map((m: any) => m.user_id);
+      let progressRecords: any[] = [];
+      let totalNodesCount = 0;
+
+      if (memberIds.length > 0) {
+        const { data: progress } = await supabase
+          .from('progress_tracking')
+          .select('user_id')
+          .in('user_id', memberIds)
+          .eq('completed', true);
+        
+        progressRecords = progress || [];
+
+        const { count } = await supabase
+          .from('roadmap_nodes')
+          .select('*', { count: 'exact', head: true });
+        
+        totalNodesCount = count || 0;
+      }
+
+      // 3. Derive dynamic presence states and map lightweight progress metrics
       const now = new Date().getTime();
       const list = paginated.map((m: any) => {
         const lastActiveTime = new Date(m.last_active_at).getTime();
@@ -108,10 +158,32 @@ export async function GET(
           status = 'recently_active';
         }
 
+        const isSelf = m.user_id === userSession.id;
+        const canViewProgress = isRequesterElevated || isSelf || progressVisibility === 'public_team';
+        const shouldObfuscateName = !isRequesterElevated && !isSelf && progressVisibility === 'anonymous';
+
+        const completedCount = progressRecords.filter((p: any) => p.user_id === m.user_id).length;
+        const completionPercent = totalNodesCount > 0 
+          ? Math.round((completedCount / totalNodesCount) * 100) 
+          : 0;
+
+        const resolvedName = m.display_name || m.profiles?.name || 'Unknown User';
+
         return {
-          ...m,
-          profile: m.profiles, // Singular compatibility mapping
+          user_id: m.user_id,
+          role: m.role,
+          joined_at: m.joined_at,
+          last_active_at: canViewProgress ? m.last_active_at : null,
+          current_streak: canViewProgress ? m.current_streak : null,
+          longest_streak: canViewProgress ? m.longest_streak : null,
+          display_name: shouldObfuscateName ? '██████' : resolvedName,
           presenceStatus: status,
+          completionPercent: canViewProgress ? completionPercent : null,
+          completedNodesCount: canViewProgress ? completedCount : null,
+          progressHidden: !canViewProgress,
+          profile: shouldObfuscateName 
+            ? { id: m.user_id, name: '██████', avatar_url: null, email: '' } 
+            : m.profiles,
         };
       });
 
